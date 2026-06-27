@@ -1,0 +1,30 @@
+/* DTS overlay (SparkFun pin remap):
+* Remaps the Adafruit Feather nRF52840 device tree to match the
+* SparkFun Pro Micro nRF52840 Mini pinout.
+*
+* SparkFun Pro Micro nRF52840 Mini key pins:
+* - Blue status LED: P0.15 (active LOW)
+* - Red LED (charge): P0.13 (not user-controllable, ignore)
+* - USB-CDC: P0.24/P0.25 (D+/D-, used automatically)
+*
+* The Adafruit Feather nRF52840 has its user LED on P0.06, which is
+* not broken out to anything on the SparkFun board — so we override
+* the led0 alias to point at the SparkFun blue LED instead.
+*/
+
+/ {
+    aliases {
+        /* Override led0 to point at the SparkFun blue LED */
+        led0 = &sparkfun_blue_led;
+    };
+    leds {
+        compatible = "gpio-leds";
+        sparkfun_blue_led: led_0 {
+            gpios = <&gpio0; 15 GPIO_ACTIVE_LOW>;
+            label = "Blue Status LED";
+        };
+    };
+};
+
+/* Disable the Adafruit Feather's default LED (P0.06) to avoid conflict */
+&led0; { status = "disabled"; };
