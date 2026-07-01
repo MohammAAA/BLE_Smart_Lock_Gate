@@ -1,18 +1,55 @@
-/* Zephyr needs to know which virtual device to map the console to */
+/* app.overlay — 5 diagnostic LEDs + USB CDC ACM console
+ * Zephyr needs to know which virtual device to map the console to
 
-/* app.overlay — define external LED on P0.20
  *
- * We create a custom LED node (not led0, to avoid any conflict with
- * the board's on-board LED definitions). The main.c references this
- * via DT_NODELABEL(ext_led).
+ * LEDs (all active-high, external through 330Ω resistor to GND):
+ *   LED 1 (P0.20) - App started
+ *   LED 2 (P0.22) - Survived SYS_INIT
+ *   LED 3 (P0.09) - USB init complete
+ *   LED 4 (P1.00) - DTR wait complete
+ *   LED 5 (P0.11) - Main loop (blinks)
+ *
+ * Note: P0.24/P0.25 are USB D+/D- — never use for GPIO.
  */
 
 / {
-    ext_leds {
+    diag_leds {
         compatible = "gpio-leds";
-        ext_led: ext_led_0 {
+        diag_led_1: diag_led_1 {
             gpios = <&gpio0 20 GPIO_ACTIVE_HIGH>;
-            label = "External LED P0.20";
+            label = "Diag LED 1 - App started";
         };
+        diag_led_2: diag_led_2 {
+            gpios = <&gpio0 22 GPIO_ACTIVE_HIGH>;
+            label = "Diag LED 2 - SYS_INIT done";
+        };
+        diag_led_3: diag_led_3 {
+            gpios = <&gpio0 17 GPIO_ACTIVE_HIGH>;
+            label = "Diag LED 3 - USB init complete";
+        };
+        diag_led_4: diag_led_4 {
+            gpios = <&gpio1 0 GPIO_ACTIVE_HIGH>;
+            label = "Diag LED 4 - DTR wait complete";
+        };
+        diag_led_5: diag_led_5 {
+            gpios = <&gpio0 11 GPIO_ACTIVE_HIGH>;
+            label = "Diag LED 5 - Main loop";
+        };
+    };
+
+    chosen {
+        zephyr,console = &cdc_acm_uart0;
+        zephyr,shell-uart = &cdc_acm_uart0;
+    };
+};
+
+&usbd {
+    status = "okay";
+};
+
+&zephyr_udc0 {
+    status = "okay";
+    cdc_acm_uart0: cdc_acm_uart0 {
+        compatible = "zephyr,cdc-acm-uart";
     };
 };

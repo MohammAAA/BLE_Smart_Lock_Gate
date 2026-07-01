@@ -1,165 +1,127 @@
-// src/main.c — external LED blinky on P0.20
+// src/main.c — 5-LED diagnostic + USB CDC ACM
 //
-// This test bypasses the on-board LED (which has confusing wiring
-// on the Tenstar/nice!nano clone) and blinks an external LED on P0.20.
+// LED progress indicator:
+//   LED 1 (P0.20) ON  = app started, GPIO configured
+//   LED 2 (P0.22) ON  = survived SYS_INIT (pre-main init complete)
+//   LED 3 (P0.09) ON  = USB init complete (CDC ACM stack initialized)
+//   LED 4 (P1.00) ON  = DTR wait complete (host connected or 5s timeout)
+//   LED 5 (P0.11) BLINK = main loop running, logging active
 //
-// Wiring:
-//   P0.20 → LED anode (long leg) → 330Ω resistor → GND
-//   GND   → LED cathode (short leg, via resistor)
-//
-// Expected behavior:
-//   - External LED blinks on/off every 500ms (clear, visible)
-//   - On-board LEDs may or may not do anything (ignore them)
-//   - No USB device enumerates (we didn't enable USB)
-//
-// If the external LED blinks: your toolchain, board definition,
-// and GPIO subsystem all work. The project is unblocked.
-// If it doesn't blink: check wiring, polarity, resistor value.
+// If the app crashes, the LEDs that are ON tell us exactly where.
 
 #include <zephyr/kernel.h>
 #include <zephyr/drivers/gpio.h>
+#include <zephyr/drivers/uart.h>
+#include <zephyr/logging/log.h>
+#include <zephyr/version.h>
 
-/* Reference the external LED via its node label in app.overlay.
- * DT_NODELABEL(ext_led) resolves to the ext_led node we defined. */
-static const struct gpio_dt_spec ext_led =
-    GPIO_DT_SPEC_GET(DT_NODELABEL(ext_led), gpios);
+LOG_MODULE_REGISTER(main, LOG_LEVEL_INF);
+
+/* Reference all 5 LEDs via their device tree node labels */
+static const struct gpio_dt_spec led1 =
+    GPIO_DT_SPEC_GET(DT_NODELABEL(diag_led_1), gpios);
+static const struct gpio_dt_spec led2 =
+    GPIO_DT_SPEC_GET(DT_NODELABEL(diag_led_2), gpios);
+static const struct gpio_dt_spec led3 =
+    GPIO_DT_SPEC_GET(DT_NODELABEL(diag_led_3), gpios);
+static const struct gpio_dt_spec led4 =
+    GPIO_DT_SPEC_GET(DT_NODELABEL(diag_led_4), gpios);
+static const struct gpio_dt_spec led5 =
+    GPIO_DT_SPEC_GET(DT_NODELABEL(diag_led_5), gpios);
+
+/* Configure a GPIO as output, initially OFF. Returns 0 on success. */
+static int config_led(const struct gpio_dt_spec *led)
+{
+    if (!device_is_ready(led->port)) {
+        return -ENODEV;
+    }
+    return gpio_pin_configure_dt(led, GPIO_OUTPUT_INACTIVE);
+}
 
 int main(void)
 {
-    int ret;
+    /* Configure all 5 LEDs. If any fails, we can't signal — spin forever. */
+    if (config_led(&led1) < 0 ||
+        config_led(&led2) < 0 ||
+        config_led(&led3) < 0 ||
+        config_led(&led4) < 0 ||
+        config_led(&led5) < 0) {
+        while (1) { k_sleep(K_SECONDS(1)); }
+    }
 
-    /* Verify the GPIO device is ready */
-    if (!device_is_ready(ext_led.port)) {
-        /* Cannot signal error without USB or LED — spin forever */
-        while (1) {
-            k_sleep(K_SECONDS(1));
+    /* === Stage 1: app started, GPIO configured === */
+     gpio_pin_set_dt(&led1, 1);
+     //k_sleep(K_MSEC(300));
+     // sob7an allah hya msh sha3'ala ela hena !!!!!!!!!!!!!!
+     // ana tested el 8 LEDs w kollohom sha3'aleen HW bs msh bynwro SW
+     // ana 3ayz bokra a5ally &led1 dy ta5od el pins eltanya w ashof htsht3'l wla la2 !!
+     // ana nfsy afhm eh elly by7sl :((
+
+    /* === Stage 2: survived SYS_INIT ===
+     * SYS_INIT runs before main() and includes USB auto-initialization
+     * (CONFIG_CDC_ACM_SERIAL_INITIALIZE_AT_BOOT). If we get here,
+     * the USB stack initialized without crashing. */
+    gpio_pin_set_dt(&led2, 1);
+    //k_sleep(K_MSEC(300));
+
+          // investigating if the issue in pinout or software, I know LED1 is HW correct so I'm using it as my benchmark
+          //gpio_pin_set_dt(&led1, 1);
+          //k_sleep(K_MSEC(4000));
+
+    /* === Stage 3: USB init complete ===
+     * The USB CDC ACM device should now be enumerated (or enumerating)
+     * on the host. Check `lsusb` and `dmesg` at this point. */
+    gpio_pin_set_dt(&led3, 1);
+
+          // investigating if the issue in pinout or software, I know LED1 is HW correct so I'm using it as my benchmark
+            //gpio_pin_set_dt(&led1, 1);
+            //k_sleep(K_MSEC(4000));
+
+    /* === Stage 4: DTR wait ===
+     * Wait for the host to open the serial port (asserts DTR).
+     * 5-second timeout — if the host doesn't connect, we proceed anyway. */
+    const struct device *const console_dev =
+        DEVICE_DT_GET(DT_CHOSEN(zephyr_console));
+            // investigating if the issue in pinout or software, I know LED1 is HW correct so I'm using it as my benchmark
+            //gpio_pin_set_dt(&led1, 1);
+            //k_sleep(K_MSEC(4000));
+    if (device_is_ready(console_dev)) {
+                  // investigating if the issue in pinout or software, I know LED1 is HW correct so I'm using it as my benchmark
+                //gpio_pin_set_dt(&led1, 1);
+                //k_sleep(K_MSEC(4000));
+        uint32_t dtr = 0;
+        for (int i = 0; i < 50 && !dtr; i++) {
+            uart_line_ctrl_get(console_dev, UART_LINE_CTRL_DTR, &dtr);
+            //k_sleep(K_MSEC(100));
+        }
+        if (dtr) {
+            /* Host connected — give the terminal a moment to settle */
+            //k_sleep(K_MSEC(200));
         }
     }
 
-    /* Configure the pin as output, initially OFF (active-high = 0 = off) */
-    ret = gpio_pin_configure_dt(&ext_led, GPIO_OUTPUT_INACTIVE);
-    if (ret < 0) {
-        while (1) {
-            k_sleep(K_SECONDS(1));
-        }
-    }
+    /* === Stage 4 complete === */
+    gpio_pin_set_dt(&led4, 1);
 
-    /* Blink the external LED every 500ms */
+      // investigating if the issue in pinout or software, I know LED1 is HW correct so I'm using it as my benchmark
+     //gpio_pin_set_dt(&led1, 1);
+     //k_sleep(K_MSEC(4000));
+
+
+    /* === Main loop === */
+    LOG_INF("=== smart-lock-gate booting ===");
+    LOG_INF("Board: %s", CONFIG_BOARD);
+    LOG_INF("Zephyr version: %s", KERNEL_VERSION_STRING);
+    LOG_INF("5 diagnostic LEDs configured");
+    LOG_INF("USB CDC ACM console ready");
+
+    int counter = 0;
     while (1) {
-        ret = gpio_pin_toggle_dt(&ext_led);
-        if (ret < 0) {
-            /* Toggle failed — pin may have been reconfigured by another driver */
-            while (1) {
-                k_sleep(K_SECONDS(1));
-            }
-        }
-        k_sleep(K_MSEC(3000));
-    }
+        gpio_pin_toggle_dt(&led5);
+           //gpio_pin_toggle_dt(&led1);
 
+        LOG_INF("alive counter=%d", counter++);
+        k_sleep(K_SECONDS(2));
+    }
     return 0;
 }
-
-
-// // sanity check
-// #include <zephyr/kernel.h>
-// #include <zephyr/drivers/gpio.h>
-// #include <zephyr/logging/log.h>
-// #include <zephyr/version.h>
-
-// /* For USB and Serial monitoring */
-// #include <zephyr/kernel.h>
-// #include <zephyr/drivers/uart.h>
-// #include <zephyr/usb/usbd.h>
-
-
-// LOG_MODULE_REGISTER(main, LOG_LEVEL_INF);
-
-// /* DT_ALIAS(led0) resolves to the board's "led0" alias in the device tree.
-//  * For sparkfun_pro_nrf52840_mini, that's P0.15 (the blue status LED).
-//  * No hardcoded pin — the board DTS handles it. */
-// static const struct gpio_dt_spec led = GPIO_DT_SPEC_GET(DT_ALIAS(led0), gpios);
-
-// // /* USB Declarations */
-// // /* 1. Define mandatory configuration string descriptor */
-// // USBD_DESC_CONFIG_DEFINE(my_usbd_fs_cfg_desc, "FS Configuration");
-
-// // /* 2. Instantiate configuration framework (Exactly 4 arguments for Zephyr 4.4) */
-// // USBD_CONFIGURATION_DEFINE(my_usbd_config, USB_SCD_SELF_POWERED, 100, &my_usbd_fs_cfg_desc);
-
-// // /* 3. Define the main hardware device structure mapping */
-// // USBD_DEVICE_DEFINE(my_usbd, DEVICE_DT_GET(DT_NODELABEL(zephyr_udc0)), 0x1209, 0x0001);
-
-
-
-// int main(void)
-// {
-//     int ret;
-
-//     /* Unlike the Arduino framework, Zephyr requires us to programmatically trigger the USB device stack initialization
-//      * in our software before it starts operating. */
-
-//     // /* Initialize base stack framework */
-//     // if (usbd_init(&my_usbd) != 0) {
-//     //     return 0;
-//     // }
-
-//     //  /* Add Full-Speed (FS) configuration parameter (Requires speed enum) */
-//     // if (usbd_add_configuration(&my_usbd, USBD_SPEED_FS, &my_usbd_config) != 0) {
-//     //     return 0;
-//     // }
-
-//     // /* Bind the automated CDC ACM instance using its string node label */
-//     // if (usbd_register_class(&my_usbd, "cdc_acm_0", USBD_SPEED_FS, 1) != 0) {
-//     //     return 0;
-//     // }
-
-//     // /* Enable and start transceiver hardware */
-//     // if (usbd_enable(&my_usbd) != 0) {
-//     //     return 0;
-//     // }
-
-
-//      /* Block execution block until screen/minicom connects on the host PC */
-//     // const struct device *const dev = DEVICE_DT_GET(DT_CHOSEN(zephyr_console));
-//     // uint32_t dtr = 0;
-//     // while (!dtr) {
-//     //     uart_line_ctrl_get(dev, UART_LINE_CTRL_DTR, &dtr);
-//     //     k_sleep(K_MSEC(100));
-//     // }
-
-//     /* The LED toggling Logic starts here */
-
-//     if (!device_is_ready(led.port)) {
-//         LOG_ERR("LED device not ready — check device tree");
-//         return -ENODEV;
-//     }
-
-//     ret = gpio_pin_configure_dt(&led, GPIO_OUTPUT_ACTIVE);
-//     if (ret < 0) {
-//         LOG_ERR("Failed to configure LED: %d", ret);
-//         return ret;
-//     }
-
-//     /* Start blinking immediately so we know the app booted */
-//     for (int i = 0; i < 5; i++) {
-//         gpio_pin_toggle_dt(&led);
-//         k_sleep(K_MSEC(100));
-//     }
-
-//     LOG_INF("smart-lock-gate booting...");
-//     LOG_INF("Board: %s", CONFIG_BOARD);
-//     LOG_INF("Zephyr version: %s", KERNEL_VERSION_STRING);
-//     LOG_INF("LED on %s pin %d (active %s)",
-//             led.port->name, led.pin,
-//             led.dt_flags & GPIO_ACTIVE_LOW ? "LOW" : "HIGH");
-
-//     int counter = 0;
-//     while (1) {
-//         gpio_pin_toggle_dt(&led);
-//         LOG_INF("alive counter=%d led_state=%d", counter++,
-//                 gpio_pin_get_dt(&led));
-//         k_sleep(K_SECONDS(3));
-//     }
-//     return 0;
-// }
-
