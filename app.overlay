@@ -15,31 +15,24 @@
 / {
     diag_leds {
         compatible = "gpio-leds";
-        diag_led_1: diag_led_1 {
-            gpios = <&gpio0 20 GPIO_ACTIVE_HIGH>;
-            label = "Diag LED 1 - App started";
-        };
-        diag_led_2: diag_led_2 {
-            gpios = <&gpio0 22 GPIO_ACTIVE_HIGH>;
-            label = "Diag LED 2 - SYS_INIT done";
-        };
-        diag_led_3: diag_led_3 {
-            gpios = <&gpio0 17 GPIO_ACTIVE_HIGH>;
-            label = "Diag LED 3 - USB init complete";
-        };
-        diag_led_4: diag_led_4 {
-            gpios = <&gpio1 0 GPIO_ACTIVE_HIGH>;
-            label = "Diag LED 4 - DTR wait complete";
-        };
-        diag_led_5: diag_led_5 {
-            gpios = <&gpio0 11 GPIO_ACTIVE_HIGH>;
-            label = "Diag LED 5 - Main loop";
+        diag_led_1: diag_led_1 { gpios = <&gpio0 20 GPIO_ACTIVE_HIGH>; label = "Diag LED 1"; };
+        diag_led_2: diag_led_2 { gpios = <&gpio0 22 GPIO_ACTIVE_HIGH>; label = "Diag LED 2"; };
+        diag_led_3: diag_led_3 { gpios = <&gpio0 9 GPIO_ACTIVE_HIGH>; label = "Diag LED 3"; };
+        diag_led_4: diag_led_4 { gpios = <&gpio1 0 GPIO_ACTIVE_HIGH>; label = "Diag LED 4"; };
+        diag_led_5: diag_led_5 { gpios = <&gpio0 11 GPIO_ACTIVE_HIGH>; label = "Diag LED 5"; };
+    };
+
+    relays {
+        compatible = "gpio-leds";
+        gate_relay: gate_relay {
+            gpios = <&gpio0 10 GPIO_ACTIVE_HIGH>;
+            label = "Gate Relay Driver";
         };
     };
 
     chosen {
-        zephyr,console = &cdc_acm_uart0;
-        zephyr,shell-uart = &cdc_acm_uart0;
+        zephyr,console = &board_cdc_acm_uart;
+        zephyr,shell-uart = &board_cdc_acm_uart;
     };
 };
 
@@ -47,9 +40,3 @@
     status = "okay";
 };
 
-&zephyr_udc0 {
-    status = "okay";
-    cdc_acm_uart0: cdc_acm_uart0 {
-        compatible = "zephyr,cdc-acm-uart";
-    };
-};

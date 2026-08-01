@@ -27,6 +27,10 @@ static const struct gpio_dt_spec led4 =
 static const struct gpio_dt_spec led5 =
     GPIO_DT_SPEC_GET(DT_NODELABEL(diag_led_5), gpios);
 
+/* relay driver */
+static const struct gpio_dt_spec relay =
+    GPIO_DT_SPEC_GET(DT_NODELABEL(gate_relay), gpios);
+
 static int config_led(const struct gpio_dt_spec *led)
 {
     if (!device_is_ready(led->port)) {
@@ -52,6 +56,14 @@ int main(void)
         config_led(&led5) < 0) {
         while (1) { k_sleep(K_SECONDS(1)); }
     }
+
+     /* Configure relay */
+    if (!device_is_ready(relay.port)) {
+        while (1) {
+             k_sleep(K_SECONDS(1));
+        }
+    }
+    gpio_pin_configure_dt(&relay, GPIO_OUTPUT_INACTIVE);
 
     /* === Stage 1: app started === */
     gpio_pin_set_dt(&led1, 1);
@@ -80,21 +92,27 @@ int main(void)
             uart_line_ctrl_get(console_dev, UART_LINE_CTRL_DTR, &dtr);
             k_sleep(K_MSEC(100));
         }
+        k_sleep(K_MSEC(500));
     }
 
     gpio_pin_set_dt(&led4, 1);
 
     /* === Main loop === */
-    printk("=== smart-lock-gate booting ===\n");
-    printk("Board: %s\n", CONFIG_BOARD);
-    printk("Zephyr version: %s\n", KERNEL_VERSION_STRING);
-    printk("USB CDC ACM console ready\n");
+    printk("\r\n=== smart-lock-gate booting ===\r\n");
+    printk("Board: %s\r\n", CONFIG_BOARD);
+    printk("Zephyr version: %s\r\n", KERNEL_VERSION_STRING);
+    printk("USB CDC ACM console ready\r\n");
+    printk("\r\n=== Relay Test ===\r\n");
+    printk("Pulsing relay every 5 seconds...\r\n\r\n");
 
     int counter = 0;
     while (1) {
         gpio_pin_toggle_dt(&led5);
-        printk("alive counter=%d\n", counter++);
+        gpio_pin_configure_dt(&relay, GPIO_INPUT);
         k_sleep(K_SECONDS(2));
+        gpio_pin_configure_dt(&relay, GPIO_OUTPUT_INACTIVE);
+        k_sleep(K_SECONDS(2));
+        printk("alive counter=%d\r\n", counter++);
     }
     return 0;
 }
