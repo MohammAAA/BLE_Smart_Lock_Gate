@@ -30,6 +30,14 @@
         };
     };
 
+    reeds {
+        compatible = "gpio-leds";
+        gate_reed: gate_reed {
+            gpios = <&gpio0 31 GPIO_PULL_UP>;
+            label = "Gate reed switch";
+        };
+    };
+
     chosen {
         zephyr,console = &board_cdc_acm_uart;
         zephyr,shell-uart = &board_cdc_acm_uart;
