@@ -1,21 +1,30 @@
-// src/main.c — Chapter 11: Intercom Integration Test
+// src/main.c
 //
-// Accepts serial commands: 'u'+Enter = unlock, 's'+Enter = status.
-// Monitors reed switch and reports gate state changes.
+// BLE:
+//   bt_enable() with async callback pattern 
+//   bt_ready_cb() that logs BLE readiness
 //
-// LED progress:
+// LED mappings:
 //   LED 1 ON  = app started
-//   LED 2 ON  = survived SYS_INIT
-//   LED 3 ON  = USB init complete
+//   LED 2 ON  = survived SYS_INIT (I am currently using this pin for relay triggering)
 //   LED 4 ON  = DTR wait complete (i.e.: host is connected)
 //   LED 5 BLINK = main loop running
+//
+// UART commands:
+//   'u' + Enter = unlock gate (pulse the relay)
+//   's' + Enter = show status
 
 #include <zephyr/kernel.h>
 #include <zephyr/drivers/gpio.h>
 #include <zephyr/drivers/uart.h>
 #include <zephyr/sys/printk.h>
 #include <zephyr/version.h>
+#include <zephyr/logging/log.h>
+#include <zephyr/bluetooth/bluetooth.h>
+#include <zephyr/bluetooth/hci.h>
 #include <stdio.h>
+
+LOG_MODULE_REGISTER(main, LOG_LEVEL_INF); // LOG_INF("TEXT"); --> becomes "INF main: TEXT"
 
 /* 5 diagnostic LEDs */
 static const struct gpio_dt_spec led1 =
@@ -45,13 +54,6 @@ static int config_led(const struct gpio_dt_spec *led)
     return gpio_pin_configure_dt(led, GPIO_OUTPUT_INACTIVE);
 }
 
-/* Busy-wait delay; does NOT depend on the kernel tick interrupt.
- * Use during boot before the scheduler is guaranteed to be running. */
-static void delay_ms(uint32_t ms)
-{
-    k_busy_wait(ms * 1000);
-}
-
 /* Pulse the relay for 500ms to unlock the gate */
 static void pulse_relay(void)
 {
@@ -60,6 +62,36 @@ static void pulse_relay(void)
     k_sleep(K_MSEC(500));
     gpio_pin_set_dt(&relay, 0);
     printk(">>> RELOCK: relay is OFF ... \r\n");
+}
+
+/* ============================================================
+ * BLE initialization
+ * ============================================================ */
+
+/* Called by the BLE stack when init completes (1-2 s after bt_enable()).
+ * Runs in the (BT RX) thread context. We must keep it short, and do NOT block. */
+static void bt_ready_cb(int err)
+{
+    if (err) {
+        LOG_ERR("BLE init failed: %d", err);
+        return;
+    }
+
+    LOG_INF("BLE ready");
+
+    /* Log our own BLE MAC address so we can verify identity */
+    bt_addr_le_t addr;
+    size_t count = 1; /* Request 1 address */
+    char addr_str[BT_ADDR_LE_STR_LEN];
+    
+    /* Fetch the local identity address */
+    bt_id_get(&addr, &count);
+
+    /* Verify we actually got an address back */
+    if (count > 0) {
+        bt_addr_le_to_str(&addr, addr_str, sizeof(addr_str));
+        LOG_INF("Gate BLE address: %s", addr_str);
+    }
 }
 
 int main(void)
@@ -96,13 +128,13 @@ int main(void)
 
     /* === Stage 1: app started === */
     gpio_pin_set_dt(&led1, 1);
-    delay_ms(300);
+    k_busy_wait(300 * 1000);
 
     /* === Stage 2: survived SYS_INIT ===
      * SYS_INIT includes USB auto-init. If we get here, USB init
      * completed without crashing. */
     //gpio_pin_set_dt(&led2, 1);
-    //delay_ms(300);
+    //k_busy_wait(300 * 1000);
 
     /* === Stage 3: USB init complete ===
      * At this point, the USB CDC ACM device should be enumerating.
@@ -110,7 +142,7 @@ int main(void)
     //gpio_pin_set_dt(&led3, 1);
 
     /* === Stage 4: DTR wait ===
-     * Wait for the host to open the serial port.
+     * Wait for the host to open the serial port (gives USB time to enumerate before we start logging)
      * 10-second timeout, if host doesn't connect, proceed anyway. */
     const struct device *const console_dev =
         DEVICE_DT_GET(DT_CHOSEN(zephyr_console));
@@ -127,12 +159,21 @@ int main(void)
 
     gpio_pin_set_dt(&led4, 1);
 
-    /* === Main loop === */
-    printk("\r\n=== Smart Lock Gate — Intercom Integration ===\r\n");
+    /* === Start BLE init (async; returns immediately) === */
+    int err = bt_enable(bt_ready_cb);
+    if (err) {
+        LOG_ERR("bt_enable failed: %d", err);
+        /* In production, we will return .. but in development phase we don't return to keep the smoke-test loop running so we can debug */
+    } else {
+        printk("BLE init started, waiting for ready callback...\r\n");
+    }
+
+    /* === Main loop .. This is identical to the previous commit === */
+    printk("\r\n=== Smart Lock Gate ===\r\n");
     printk("Board: %s\r\n", CONFIG_BOARD);
     printk("Zephyr version: %s\r\n", KERNEL_VERSION_STRING);
-    printk("Commands: 'u' + Enter = unlock (pulse relay)\r\n");
-    printk("          's' + Enter = status\r\n");
+    printk("Commands: 'u' + Enter = unlock gate (pulse the relay)\r\n");
+    printk("          's' + Enter = show status\r\n");
     printk("\r\n");
 
     // Monitor the last state of the gate

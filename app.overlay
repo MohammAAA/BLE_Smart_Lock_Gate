@@ -2,7 +2,7 @@
  * Zephyr needs to know which virtual device to map the console to
 
  *
- * LEDs (all active-high, external through 330Ω resistor to GND):
+ * LEDs (all active-high):
  *   LED 1 (P0.20) - App started
  *   LED 2 (P0.22) - Survived SYS_INIT
  *   LED 3 (P0.09) - USB init complete
