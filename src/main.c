@@ -23,6 +23,7 @@
 #include <zephyr/bluetooth/bluetooth.h>
 #include <zephyr/bluetooth/hci.h>
 #include <stdio.h>
+#include "ble/scan.h" 
 
 LOG_MODULE_REGISTER(main, LOG_LEVEL_INF); // LOG_INF("TEXT"); --> becomes "INF main: TEXT"
 
@@ -92,6 +93,10 @@ static void bt_ready_cb(int err)
         bt_addr_le_to_str(&addr, addr_str, sizeof(addr_str));
         LOG_INF("Gate BLE address: %s", addr_str);
     }
+
+    /* Kick off passive scan */
+    LOG_INF("BLE ready, starting scan ...");
+    scan_start();
 }
 
 int main(void)

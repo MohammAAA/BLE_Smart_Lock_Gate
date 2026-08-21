@@ -4,7 +4,8 @@ find_package(Zephyr REQUIRED HINTS $ENV{ZEPHYR_BASE})
 project(smart_lock_gate)
 target_sources(app PRIVATE
 src/main.c
+src/ble/scan.c
 )
 target_include_directories(app PRIVATE
-    include
+    src
 )
