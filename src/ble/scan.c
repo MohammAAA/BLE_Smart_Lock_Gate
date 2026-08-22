@@ -1,6 +1,6 @@
 /*
  * BLE Smart Lock - Gate Scanner
- * Phase 2 Lesson 2: scan start + callback + workqueue logging
+ * Phase 2 Lesson 2: parse adv payload + extract device_uuid from MSD.
  *
  * L2 scope: log every received adv (addr, RSSI, adv_type). No parsing yet.
  *
@@ -15,10 +15,12 @@
 
 #include "scan.h"
 #include <zephyr/kernel.h>
-#include <zephyr/bluetooth/bluetooth.h>   /* bt_le_scan_start, BT_LE_SCAN_PARAM */
+#include <zephyr/bluetooth/bluetooth.h>   /* bt_le_scan_start, BT_LE_SCAN_PARAM, BT_DATA_MANUFACTURER_DATA, struct bt_data, bt_data_parse */
 #include <zephyr/bluetooth/addr.h>        /* bt_addr_le_t, bt_addr_le_to_str     */
 #include <zephyr/bluetooth/gap.h>         /* BT_GAP_ADV_TYPE_* (currently this is for reference only)  */
 #include <zephyr/logging/log.h>
+#include <zephyr/net_buf.h>               /* struct net_buf_simple, net_buf_simple_init_with_data       */
+#include <zephyr/sys/printk.h>            /* snprintk */
 
 LOG_MODULE_REGISTER(ble_scan);
 
@@ -40,8 +42,75 @@ K_MSGQ_DEFINE(scan_msgq,
 	      SCAN_MSGQ_DEPTH,
 	      4);
 
+/* parse_cb()
+ *
+ * bt_data_parse() calls this once per AD structure in the adv payload.
+ *
+ * Return value semantics:
+ *   true  = keep parsing (look at the next AD structure)
+ *   false = stop parsing (we found what we need, OR the payload is malformed)
+ *
+ * Edge cases handled:
+ *   - Empty MSD (data_len < 2): can't even read Company ID, return false
+ *     to stop. This adv is bogus - don't try to parse further structures.
+ *   - Multiple MSDs in one adv: spec says only one MSD per adv. We stop at
+ *     the first match. If there's another MSD with our CID later (shouldn't
+ *     happen), we'd miss it.
+ *   - MSD with our CID but truncated payload: we mark found_msd=true and
+ *     stop, then the workqueue handler checks msd_len < MSD_LEN_PAYLOAD_MIN
+ *     and rejects.
+ */
+static bool parse_cb(struct bt_data *data, void *user_data)
+{
+	struct parse_ctx *ctx = (struct parse_ctx *)user_data;
 
-/* --- Workqueue handler (drains the queue, logs each adv) ------------- */
+	if (data->type != BT_DATA_MANUFACTURER_DATA) {
+		return true;  /* not MSD, keep looking */
+	}
+
+	/* MSD layout: [Company ID: 2 bytes LE] [payload: data_len - 2 bytes] */
+	if (data->data_len < 2) {
+		/* Malformed: Company ID alone requires 2 bytes. Stop parsing. */
+		return false;
+	}
+
+	uint16_t cid = (uint16_t)data->data[0]
+		     | ((uint16_t)data->data[1] << 8);
+
+	if (cid != SMART_LOCK_COMPANY_ID) {
+		return true;  /* MSD but not ours - keep looking (rare) */
+	}
+
+	/* Match. Capture pointer + length, stop parsing. */
+	ctx->found_msd = true;
+	ctx->msd_data = data->data + 2;          /* skip Company ID */
+	ctx->msd_len  = (uint8_t)(data->data_len - 2);
+	return false;  /* we have what we need */
+}
+
+/* Format a 16-byte UUID as 32 lowercase hex chars (no dashes).
+ * Uses snprintk for size-safety. Output buffer must be >= 33 bytes.
+ *
+ * Why no dashes in L3:
+ *   The dashed RFC 4122 format ("01234567-89ab-cdef-...") is human-friendly
+ *   but adds 4 bytes to the log line and 4 format-string evaluations per
+ *   adv. In L3 we just want to verify parsing works - hex-only is enough.
+ *   Phase 4 will switch to a structured log (LOG_INF("uuid", LOG_HEX(...)))
+ *   that doesn't need string formatting at all.
+ */
+static void format_uuid_hex(const uint8_t uuid[MSD_LEN_UUID], char *out, size_t out_len)
+{
+	if (out_len < (MSD_LEN_UUID * 2U) + 1U) {
+		return;  /* buffer too small - caller error, silently bail */
+	}
+
+	for (uint8_t i = 0U; i < MSD_LEN_UUID; i++) {
+		(void)snprintk(out + (i * 2U), 3U, "%02x", uuid[i]);
+	}
+	out[MSD_LEN_UUID * 2U] = '\0';
+}
+
+/* --- Workqueue handler (drains the queue, parses payload, logs) ------------- */
 static void scan_work_handler(struct k_work *work)
 {
 	ARG_UNUSED(work);
@@ -56,6 +125,68 @@ static void scan_work_handler(struct k_work *work)
 	while (k_msgq_get(&scan_msgq, &msg, K_NO_WAIT) == 0) {
 		bt_addr_le_to_str(&msg.addr, addr_str, sizeof(addr_str));
 
+		/* Wrap msg.payload in a net_buf_simple so bt_data_parse can
+		 * iterate it. net_buf_simple_init_with_data does NOT copy -
+		 * it just sets pointers into our local msg.payload. bt_data_parse
+		 * will advance those pointers as it walks the AD structures,
+		 * modifying msg.payload's view of itself - but since msg is
+		 * a stack-local copy owned by this function, that's fine.
+		 *
+		 * Passing msg.payload_len (not BT_ADV_PAYLOAD_MAX) means
+		 * bt_data_parse won't try to read past actual data, so trailing
+		 * zero-padding (if any) in the controller's report is ignored.
+		 */
+		struct net_buf_simple parse_buf;
+		net_buf_simple_init_with_data(&parse_buf,
+		                              msg.payload,
+		                              msg.payload_len);
+
+		struct parse_ctx ctx = {
+			.found_msd = false,
+			.msd_data  = NULL,
+			.msd_len   = 0U,
+		};
+		bt_data_parse(&parse_buf, parse_cb, &ctx);
+
+		if (!ctx.found_msd) {
+			/* Not our device. Log at DBG level so INF log doesn't
+			 * flood with every smart bulb in range. (DBG is off
+			 * in prj.conf - these lines won't appear in normal runs.)
+			 *
+			 * Phase 3 will move these to a per-address drop counter
+			 * so we can log "ignored N advs from M non-matching
+			 * devices in the last 10s" rather than per-adv spam.
+			 */
+			LOG_DBG("non-match: addr=%s rssi=%d type=%u len=%u",
+				addr_str, msg.rssi, msg.adv_type, msg.payload_len);
+			continue;
+		}
+
+		/* MSD with our Company ID found. Validate payload length. */
+		if (ctx.msd_len < MSD_LEN_PAYLOAD_MIN) {
+			LOG_WRN("trunc MSD: addr=%s rssi=%d msd_len=%u (need %u)",
+				addr_str, msg.rssi, ctx.msd_len,
+				MSD_LEN_PAYLOAD_MIN);
+			continue;
+		}
+
+		uint8_t version = ctx.msd_data[MSD_OFFSET_VERSION];
+		if (version != SMART_LOCK_PACKET_VERSION) {
+			LOG_WRN("ver mismatch: addr=%s rssi=%d got=%u exp=%u",
+				addr_str, msg.rssi, version,
+				SMART_LOCK_PACKET_VERSION);
+			continue;
+		}
+
+		/* UUID bytes are in network order (MSB first) per RFC 4122.
+		 * The phone app generates a UUID and writes the 16 raw bytes
+		 * into the MSD payload in the same order they appear in the
+		 * UUID string. So uuid[0] is the first hex pair, etc.
+		 */
+		char uuid_str[MSD_LEN_UUID * 2U + 1U];  /* 33 bytes */
+		format_uuid_hex(&ctx.msd_data[MSD_OFFSET_UUID],
+				uuid_str, sizeof(uuid_str));
+
 		/* adv_type is the raw 3-bit PDU Type field from the adv PDU
 		 * header (recall Phase 0 L4). Zephyr passes it as a uint8_t.
 		 * It maps to BT_GAP_ADV_TYPE_* constants:
@@ -69,8 +200,9 @@ static void scan_work_handler(struct k_work *work)
 		 * We expect mostly type 0 (ADV_IND) from phones. Apple devices
 		 * sometimes use type 3 (NONCONN) for beaconing.
 		 */
-		LOG_INF("adv: addr=%-30s rssi=%4d type=%u",
-			addr_str, msg.rssi, msg.adv_type);
+
+		LOG_INF("MATCH: addr=%s rssi=%4d type=%u ver=%u uuid=%s",
+			addr_str, msg.rssi, msg.adv_type, version, uuid_str);
 	}
 }
 
@@ -126,24 +258,55 @@ K_WORK_DEFINE(scan_work, scan_work_handler);
  * the HCI Adv Report event spec). We drop those. addr == NULL should never
  * happen but we guard anyway - a NULL deref in BT RX context would
  * hard-fault the whole BT stack and we'd see a K_FATAL panic.
+ * 
+ * L3 changes: we now copy the adv payload out of `buf` into msg.payload
+ * before enqueuing. Total work in scan_cb grows from ~10 us (L2) to
+ * ~20 us (L3): one 7-byte addr copy + one 9-byte metadata copy + one
+ * up-to-31-byte payload memcpy + ring buffer put + work submit.
+ *
+ * Still well under the 100 us target. The 31-byte memcpy is ~12 cycles
+ * on Cortex-M4 with optimized memcpy (32-byte aligned loop).
+ *
+ * The payload copy MUST happen here, not in the workqueue. The `buf`
+ * pointer is owned by the BT stack and is recycled (returned to its
+ * pool) the moment scan_cb returns. If we passed `buf` itself into the
+ * queue, by the time the workqueue looked at it, the buffer would
+ * contain random other BT event data - silent corruption.
+ *
+ * Recall Phase 0 L4 - the adv payload is up to 31 bytes (legacy ADV_IND)
+ * or up to 254 bytes (extended adv with Adv Extensions, BLE 5.0+). We
+ * only support legacy in L3 (CONFIG_BT_CTLR_ADV_EXT not enabled for
+ * scanning). If extended adv support is added later, this copy needs to
+ * be guarded against payload_len > 31.
+ *
  */
 static void scan_cb(const bt_addr_le_t *addr,
 		    int8_t rssi,
 		    uint8_t adv_type,
 		    struct net_buf_simple *buf)
 {
-	ARG_UNUSED(buf);  /* L3 will replace this with bt_data_parse */
 
 	struct scan_msg msg;
 
-	if ((addr == NULL) || (rssi == 0)) {
+	if ((addr == NULL) || (rssi == 0) || (buf == NULL)) {
 		return;
+	}
+	/* Defensive: clamp payload to our buffer size. Should never trigger
+	 * for legacy ADV (max 31 bytes), but extended adv reports can be up
+	 * to 254 bytes. If we ever enable BT_LE_SCAN_OPT_EXT_ADV, this guard
+	 * prevents a buffer overflow (we'd just truncate, not crash).
+	 */
+	uint8_t copy_len = (uint8_t)buf->len;
+	if (copy_len > BT_ADV_PAYLOAD_MAX) {
+		copy_len = BT_ADV_PAYLOAD_MAX;
 	}
 
 	/* Copy out the 3 fields we need. Total 9 bytes. */
 	msg.addr     = *addr;
 	msg.rssi     = rssi;
 	msg.adv_type = adv_type;
+	msg.payload_len = copy_len;
+	memcpy(msg.payload, buf->data, copy_len);
 
 	/* Enqueue. If the queue is full, k_msgq_put returns -ENOMSG and the
 	 * newest adv is silently dropped. We'll measure the drop rate in L4
@@ -193,9 +356,11 @@ int scan_start(void)
 	}
 
 	/* 0.625 ms = 5/8 ms. Integer-only conversion: ms = units * 5 / 8. */
-	LOG_INF("scan started: interval=%u (%u ms) window=%u (%u ms) , type=passive, opt=none",
-		SCAN_INTERVAL, (SCAN_INTERVAL * 5 / 8),
-		SCAN_WINDOW,   (SCAN_WINDOW   * 5 / 8));
+	LOG_INF("scan started: interval=%u (%u ms) window=%u (%u ms) "
+		"type=passive opt=none cid=0x%04X",
+		SCAN_INTERVAL, (SCAN_INTERVAL * 5U / 8U),
+		SCAN_WINDOW,   (SCAN_WINDOW   * 5U / 8U),
+		SMART_LOCK_COMPANY_ID);
 	return 0;
 }
 
