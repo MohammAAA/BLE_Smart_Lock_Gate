@@ -18,13 +18,13 @@
 /* --- Scan parameters (locked in Phase 0 L5) ---------------------------
  *
  * scan_interval = 400 * 0.625 ms = 250 ms  (one full cycle over 3 adv ch)
- * scan_window   =  80 * 0.625 ms =  50 ms  (RX-on time per cycle)
- * duty cycle    = 80/400 = 20%
+ * scan_window   =  160 * 0.625 (i.e.: 5/8) ms =  100 ms  (RX-on time per cycle)
+ * duty cycle    = 160/400 = 40%
  * scan_options = BT_LE_SCAN_OPT_NONE
  */
 
 #define SCAN_INTERVAL          400   /* 250 ms */
-#define SCAN_WINDOW            80    /* 50 ms */
+#define SCAN_WINDOW            160    /* 100 ms */
 #define SCAN_MSGQ_DEPTH        16    /* advs queued before workqueue drains */
 #define BT_ADV_PAYLOAD_MAX     31U   /* legacy ADV_IND / NONCONN / SCAN_IND */
 
@@ -149,7 +149,7 @@ struct parse_ctx {
  *
  * Scan parameters are hard-coded to Phase 0 L5 design:
  *   - interval  = 400 * 0.625 ms = 250 ms
- *   - window    =  80 * 0.625 ms =  50 ms
+ *   - window    = 160 * 0.625 ms =  100 ms
  *   - type      = BT_LE_SCAN_TYPE_PASSIVE
  *   - options   = BT_LE_SCAN_OPT_NONE  (no dup filter, no whitelist)
  *
