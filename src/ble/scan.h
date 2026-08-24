@@ -3,32 +3,48 @@
 
 /*
  * BLE Smart Lock - Gate Scanner
- * Phase 2 Lesson 3: parse adv payload, extract device_uuid from MSD
+ * Phase 2 Checkpoint 4: threading model + stats + drop counters + stack monitor.
  *
+ * Ch4 scope:
+ *   - Bump SCAN_MSGQ_DEPTH (16 -> 32, more burst tolerance)
+ *   - Bump SCAN_WINDOW (80 -> 160, 50 ms -> 100 ms)
+ *     (Rationale: 1 Hz phone advertisers need wider window for <1s discovery)
+ *   - Stats counters: track advs matched/non-matched/truncated/version-mismatched
+ *   - Drop counters: track k_msgq_put failures and scan_cb guard rejects
+ *   - Periodic stats dump every 10 s (k_work_delayable)
+ *   - Stack high-water mark monitoring for the system workqueue
  *
- * L2 scope: log every received adv (addr, RSSI, type). No parsing yet.
- * L3 will add bt_data_parse + MSD extraction + version for matched advs
- * L4 will formalize the threading model and add a dedicated workqueue.
+ * Ch2 scope: logged every received adv (addr, RSSI, type). No parsing yet.
+ * Ch3 scope: added bt_data_parse + MSD extraction + version for matched advs
+ * Ch4 scope: formalized the threading model and add a dedicated workqueue.
  */
 
 #include <zephyr/kernel.h>
 #include <zephyr/bluetooth/addr.h>        /* bt_addr_le_t     */
 
-
-/* --- Scan parameters (locked in Phase 0 L5) ---------------------------
+/* --- Scan parameters ------------------------------------------------ *
  *
- * scan_interval = 400 * 0.625 ms = 250 ms  (one full cycle over 3 adv ch)
- * scan_window   =  160 * 0.625 (i.e.: 5/8) ms =  100 ms  (RX-on time per cycle)
- * duty cycle    = 160/400 = 40%
- * scan_options = BT_LE_SCAN_OPT_NONE
+ * Ch4 CHANGES:
+ *     Observation after testing: phone at 1 Hz advertising gives ~5 s
+ *     discovery latency at window=50 ms.
+ *     So we tune SCAN_WINDOW:  80 -> 160  (50 ms -> 100 ms)
+ *     Trade-off: duty cycle 20% -> 40%. Power irrelevant (wired). WiFi
+ *     coexistence surface ~2x - acceptable for residential application.
+ *     Production revisit: Phase 6, when phone app actually drives advertising rate.
+ *
+ *   - SCAN_MSGQ_DEPTH: 16 -> 32
+ *     Bumping to 32 = 1.6 s buffer, handles ~1 s workqueue stalls
+ *     (USB reconnect, LOG backpressure). RAM cost: 32 * 41 bytes = 1312
+ *     bytes, still 0.5% of nRF52840's 256 KB RAM.
  */
 
 #define SCAN_INTERVAL          400   /* 250 ms */
 #define SCAN_WINDOW            160    /* 100 ms */
-#define SCAN_MSGQ_DEPTH        16    /* advs queued before workqueue drains */
+#define SCAN_MSGQ_DEPTH        32    /* advs queued before workqueue drains */
+#define SCAN_STATS_PERIOD_SEC   10   /* periodic stats dump interval */
 #define BT_ADV_PAYLOAD_MAX     31U   /* legacy ADV_IND / NONCONN / SCAN_IND */
 
-/* --- L3: Our Manufacturer ID ----------------------------------------
+/* --- Ch3: Our Manufacturer ID ----------------------------------------
  *
  * Use 0xFFFF for development. The Bluetooth SIG reserves this value for
  * testing - no production device is supposed to use it. For our private
@@ -48,7 +64,7 @@
  */
 #define SMART_LOCK_COMPANY_ID     0xFFFFU
 
-/* --- L3: Our MSD payload layout -----------------------------
+/* --- Ch3: Our MSD payload layout -----------------------------
  *
  * Wire format of the full MSD AD structure:
  *
@@ -99,8 +115,8 @@
 
 /* --- Adv message queue (callback -> workqueue) -----------------------
  *
- * L3 change: scan_msg now carries the adv payload alongside addr/rssi/type.
- * Size grows from 9 bytes (L2) to 41 bytes. K_MSGQ_DEFINE buffer grows
+ * Ch3 change: scan_msg now carries the adv payload alongside addr/rssi/type.
+ * Size grows from 9 bytes (Ch2) to 41 bytes. K_MSGQ_DEFINE buffer grows
  * from 144 bytes to 656 bytes - still trivial on our nRF52840's 256 KB RAM.
  *
  * Why payload is copied inline (not via a pointer):
@@ -140,6 +156,41 @@ struct parse_ctx {
 	uint8_t        msd_len;         /* payload length after CID           */
 };
 
+/* --- Ch4: Stats counters -------------------------------------------- *
+ *
+ * Single-producer (scan_cb in BT RX thread) + single-reader (stats_work
+ * in system workqueue). 32-bit aligned reads/writes are atomic on
+ * Cortex-M4, so no lock needed. Reader may see slightly stale values
+ * (eventual consistency) - acceptable for diagnostic metrics.
+ *
+ * Counter semantics:
+ *   - Counted at scan_cb: total_advs, guard_*, queue_drops
+ *   - Counted at scan_work_handler: matched, non_matched, trunc_msd, ver_mismatch
+ *
+ * Why some counters live in scan_cb vs scan_work_handler:
+ *   - Counters in scan_cb catch EVERY adv (including ones dropped before
+ *     reaching the workqueue due to queue full).
+ *   - Counters in scan_work_handler only catch advs that made it through
+ *     the queue (so queue_drops is what's missing).
+ *
+ *   For diagnosis, you want both views. If total_advs - matched - non_matched
+ *   - trunc_msd - ver_mismatch != queue_drops, you have a bug.
+ */
+struct scan_stats {
+	/* Counted in scan_cb (BT RX thread) */
+	uint32_t total_advs;        /* every adv that reached scan_cb        */
+	uint32_t guard_addr_null;  /* addr == NULL (defensive guard)        */
+	uint32_t guard_rssi_zero;  /* rssi == 0 (Controller unknown)       */
+	uint32_t guard_buf_null;   /* buf == NULL (defensive guard)         */
+	uint32_t queue_drops;       /* k_msgq_put returned -ENOMSG (full)     */
+
+	/* Counted in scan_work_handler (system workqueue) */
+	uint32_t matched_advs;       /* CID matched, version OK              */
+	uint32_t non_matched_advs;   /* CID didn't match (smart bulb etc.)   */
+	uint32_t trunc_msd;          /* CID matched but payload < 17 bytes    */
+	uint32_t version_mismatch;   /* CID matched but version wrong        */
+};
+
 
 /**
  * Start BLE passive scan.
@@ -147,7 +198,7 @@ struct parse_ctx {
  * Must be called AFTER bt_ready_cb fires (i.e. the BT host+controller are
  * fully initialized). Calling before bt_enable completes returns -EAGAIN.
  *
- * Scan parameters are hard-coded to Phase 0 L5 design:
+ * Scan parameters:
  *   - interval  = 400 * 0.625 ms = 250 ms
  *   - window    = 160 * 0.625 ms =  100 ms
  *   - type      = BT_LE_SCAN_TYPE_PASSIVE
@@ -164,4 +215,9 @@ int scan_start(void);
  */
 int scan_stop(void);
 
+/**
+ * Get a snapshot of scan stats (copies into caller-provided struct).
+ * Useful for caller-side reporting (e.g., status command in main.c).
+ */
+void scan_get_stats(struct scan_stats *out);
 #endif /* BLE_SCAN_H_ */

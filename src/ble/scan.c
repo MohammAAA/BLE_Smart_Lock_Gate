@@ -1,17 +1,28 @@
 /*
  * BLE Smart Lock - Gate Scanner
- * Phase 2 Lesson 2: parse adv payload + extract device_uuid from MSD.
+ * Phase 2 Chapter 4: threading model + stats + drop counters + stack monitor
  *
- * L2 scope: log every received adv (addr, RSSI, adv_type). No parsing yet.
+ * Ch4 scope: 
+ *   - stats counters (struct scan_stats)
+ *   - drop counter in scan_cb (queue_drops)
+ *   - guard counters in scan_cb (addr/rssi/buf NULL)
+ *   - matched/non_matched/trunc/ver_mismatch counters in workqueue
+ *   - periodic stats dump via k_work_delayable
+ *   - stack high-water mark via k_thread_stack_space_get
  *
- * Threading model (high level - deep dive in L4):
+ * Threading model:
  *
- *   [BT RX thread]                 [System workqueue]      [Log proc thread]
- *   scan_cb  ----k_msgq_put---->  scan_work_handler  ---->  LOG_INF
- *                K_NO_WAIT        k_msgq_get K_NO_WAIT     (deferred UART)
+*   [BT RX thread]                  [System workqueue]            [Log proc thread]
+ *   prio ~-7                         prio -1                        prio 0 (low)
+ *   --------                         ---------                      -------------
+ *   scan_cb  ----k_msgq_put---->   scan_work_handler  ----LOG---->  ring buf -> UART
+ *                K_NO_WAIT          k_msgq_get K_NO_WAIT
+ *                                    ~50-100us per msg
+ *   ~20us per adv (incl. memcpy)
  *
- * Hard rule: scan_cb runs in BT RX thread context. we shall NEVER block there.
- */
+ *                                   stats_work_handler (delayable)
+ *                                   every 10s: dump counters + stack
+*/
 
 #include "scan.h"
 #include <zephyr/kernel.h>
@@ -24,7 +35,8 @@
 
 LOG_MODULE_REGISTER(ble_scan);
 
-
+/* --- Stats (single producer in BT RX thread, single consumer (reader) in stats work) */
+static struct scan_stats stats;
 
 /* k_msgq is a fixed-size ring buffer. Single-producer (BT RX thread) and
  * single-consumer (system workqueue) -> no locking needed internally.
@@ -91,10 +103,10 @@ static bool parse_cb(struct bt_data *data, void *user_data)
 /* Format a 16-byte UUID as 32 lowercase hex chars (no dashes).
  * Uses snprintk for size-safety. Output buffer must be >= 33 bytes.
  *
- * Why no dashes in L3:
+ * Why no dashes in Ch3:
  *   The dashed RFC 4122 format ("01234567-89ab-cdef-...") is human-friendly
  *   but adds 4 bytes to the log line and 4 format-string evaluations per
- *   adv. In L3 we just want to verify parsing works - hex-only is enough.
+ *   adv. In Ch3 we just want to verify parsing works - hex-only is enough.
  *   Phase 4 will switch to a structured log (LOG_INF("uuid", LOG_HEX(...)))
  *   that doesn't need string formatting at all.
  */
@@ -149,8 +161,13 @@ static void scan_work_handler(struct k_work *work)
 		bt_data_parse(&parse_buf, parse_cb, &ctx);
 
 		if (!ctx.found_msd) {
-			/* Not our device. Log at DBG level so INF log doesn't
-			 * flood with every smart bulb in range. (DBG is off
+		
+			/* Not our device, increment the non_matched_advs counter */
+			stats.non_matched_advs++;
+			
+			 
+			 /* Log at DBG level so INF log doesn't
+			 * flood with every unwanter in range. (DBG is off
 			 * in prj.conf - these lines won't appear in normal runs.)
 			 *
 			 * Phase 3 will move these to a per-address drop counter
@@ -164,6 +181,7 @@ static void scan_work_handler(struct k_work *work)
 
 		/* MSD with our Company ID found. Validate payload length. */
 		if (ctx.msd_len < MSD_LEN_PAYLOAD_MIN) {
+			stats.trunc_msd++;
 			LOG_WRN("trunc MSD: addr=%s rssi=%d msd_len=%u (need %u)",
 				addr_str, msg.rssi, ctx.msd_len,
 				MSD_LEN_PAYLOAD_MIN);
@@ -172,12 +190,14 @@ static void scan_work_handler(struct k_work *work)
 
 		uint8_t version = ctx.msd_data[MSD_OFFSET_VERSION];
 		if (version != SMART_LOCK_PACKET_VERSION) {
+			stats.version_mismatch++;
 			LOG_WRN("ver mismatch: addr=%s rssi=%d got=%u exp=%u",
 				addr_str, msg.rssi, version,
 				SMART_LOCK_PACKET_VERSION);
 			continue;
 		}
-
+	
+		stats.matched_advs++;
 		/* UUID bytes are in network order (MSB first) per RFC 4122.
 		 * The phone app generates a UUID and writes the 16 raw bytes
 		 * into the MSD payload in the same order they appear in the
@@ -188,7 +208,7 @@ static void scan_work_handler(struct k_work *work)
 				uuid_str, sizeof(uuid_str));
 
 		/* adv_type is the raw 3-bit PDU Type field from the adv PDU
-		 * header (recall Phase 0 L4). Zephyr passes it as a uint8_t.
+		 * header. Zephyr passes it as a uint8_t.
 		 * It maps to BT_GAP_ADV_TYPE_* constants:
 		 *
 		 *   0  ADV_IND               connectable, scannable, undirected
@@ -226,7 +246,7 @@ K_WORK_DEFINE(scan_work, scan_work_handler);
  * are serviced, encryption handshakes time out, the controller's event
  * queue overflows and we start seeing "BT_EVT RX overflow" warnings).
  *
- * Hard rules (will be deepened in L4):
+ * Hard rules:
  *
  *   NO k_sleep / k_msleep / k_busy_wait        - obviously
  *   NO blocking k_msgq_get / k_sem_take        - use K_NO_WAIT
@@ -240,18 +260,16 @@ K_WORK_DEFINE(scan_work, scan_work_handler);
  *       (a) it keeps scan_cb minimal and auditable,
  *       (b) the workqueue is on a sensible thread priority where a long
  *           LOG_INF format-string evaluation won't impact BLE timing,
- *       (c) we'll add parsing in L3 and want a stable structure now (we won't update this callback in L3,
- *           instead we will update the workqueue handler (scan_work_handler())).
  *
  * Safe operations in scan_cb:
  *   1. Copy fields out of `addr` (bt_addr_le_t is 7 bytes; cheap copy)
- *   2. Copy bytes out of `buf` IF we need them (we don't in L2)
+ *   2. Copy bytes out of `buf` IF we need them
  *   3. k_msgq_put(&q, &msg, K_NO_WAIT) - lock-free if no contention
  *   4. k_work_submit(&work) - sets a bit and signals the workqueue
  *
  * IMPORTANT: `buf` (struct net_buf_simple *) points to memory owned by the
  * BT stack. The buffer is cleared AFTER this callback returns. If we
- * need any bytes from it, we copy them out NOW. We don't in L2; L3 will use
+ * need any bytes from it, we copy them out NOW. We don't in Ch2; Ch3 uses
  * bt_data_parse() on a stack-local copy.
  *
  * Defensive: rssi == 0 is the Controller's "unknown" sentinel (defined in
@@ -259,9 +277,9 @@ K_WORK_DEFINE(scan_work, scan_work_handler);
  * happen but we guard anyway - a NULL deref in BT RX context would
  * hard-fault the whole BT stack and we'd see a K_FATAL panic.
  * 
- * L3 changes: we now copy the adv payload out of `buf` into msg.payload
- * before enqueuing. Total work in scan_cb grows from ~10 us (L2) to
- * ~20 us (L3): one 7-byte addr copy + one 9-byte metadata copy + one
+ * Ch3 changes: we now copy the adv payload out of `buf` into msg.payload
+ * before enqueuing. Total work in scan_cb grows from ~10 us (Ch2) to
+ * ~20 us (Ch3): one 7-byte addr copy + one 9-byte metadata copy + one
  * up-to-31-byte payload memcpy + ring buffer put + work submit.
  *
  * Still well under the 100 us target. The 31-byte memcpy is ~12 cycles
@@ -273,9 +291,9 @@ K_WORK_DEFINE(scan_work, scan_work_handler);
  * queue, by the time the workqueue looked at it, the buffer would
  * contain random other BT event data - silent corruption.
  *
- * Recall Phase 0 L4 - the adv payload is up to 31 bytes (legacy ADV_IND)
+ * Recall Phase 0 Ch4 - the adv payload is up to 31 bytes (legacy ADV_IND)
  * or up to 254 bytes (extended adv with Adv Extensions, BLE 5.0+). We
- * only support legacy in L3 (CONFIG_BT_CTLR_ADV_EXT not enabled for
+ * only support legacy in Ch3 (CONFIG_BT_CTLR_ADV_EXT not enabled for
  * scanning). If extended adv support is added later, this copy needs to
  * be guarded against payload_len > 31.
  *
@@ -285,10 +303,23 @@ static void scan_cb(const bt_addr_le_t *addr,
 		    uint8_t adv_type,
 		    struct net_buf_simple *buf)
 {
+	stats.total_advs++;
 
-	struct scan_msg msg;
-
-	if ((addr == NULL) || (rssi == 0) || (buf == NULL)) {
+	/* Defensive guards. Each branch increments its own counter so we
+	 * can see which guard is firing (or none). In normal operation all
+	 * three should be 0. Non-zero means either a controller bug or
+	 * (more likely) a misbehaving device.
+	 */
+	if (addr == NULL) {
+		stats.guard_addr_null++;
+		return;
+	}
+	if (rssi == 0) {
+		stats.guard_rssi_zero++;
+		return;
+	}
+	if (buf == NULL) {
+		stats.guard_buf_null++;
 		return;
 	}
 	/* Defensive: clamp payload to our buffer size. Should never trigger
@@ -300,7 +331,8 @@ static void scan_cb(const bt_addr_le_t *addr,
 	if (copy_len > BT_ADV_PAYLOAD_MAX) {
 		copy_len = BT_ADV_PAYLOAD_MAX;
 	}
-
+	
+	struct scan_msg msg;
 	/* Copy out the 3 fields we need. Total 9 bytes. */
 	msg.addr     = *addr;
 	msg.rssi     = rssi;
@@ -308,13 +340,18 @@ static void scan_cb(const bt_addr_le_t *addr,
 	msg.payload_len = copy_len;
 	memcpy(msg.payload, buf->data, copy_len);
 
-	/* Enqueue. If the queue is full, k_msgq_put returns -ENOMSG and the
-	 * newest adv is silently dropped. We'll measure the drop rate in L4
-	 * and tune SCAN_MSGQ_DEPTH accordingly. For L2 (just logging) the
-	 * drop rate will be ~0 unless we stuff ~25 phones in front of the
-	 * gate at once.
+	/* Enqueue. If the queue is full, k_msgq_put returns -ENOMSG, the
+	 * newest adv is dropped, and the queue_drops counter increments.
 	 */
-	(void)k_msgq_put(&scan_msgq, &msg, K_NO_WAIT);
+	int rc = k_msgq_put(&scan_msgq, &msg, K_NO_WAIT);
+	if (rc == -ENOMSG) {
+		stats.queue_drops++;
+		/* We don't submit the work here, we'd just reschedule a
+		 * saturated workqueue. The workqueue will pick up the
+		 * next adv when it gets CPU time.
+		 */
+		return;
+	}
 
 	/* Schedule the workqueue to drain. Cheap (set bit + signal) if
 	 * already pending; this is the canonical producer/consumer pattern.
@@ -323,6 +360,84 @@ static void scan_cb(const bt_addr_le_t *addr,
 }
 
 /* ---------------------------- Public APIs ----------------------------- */
+
+static void stats_work_handler(struct k_work *work);
+
+K_WORK_DELAYABLE_DEFINE(stats_work, stats_work_handler);
+
+static void stats_work_handler(struct k_work *work)
+{
+	ARG_UNUSED(work);
+
+	/* Snapshot under no lock - 32-bit reads are atomic on Cortex-M4.
+	 * Reader may see slightly stale values from one counter while
+	 * another is fresh - acceptable for diagnostics.
+	 */
+	uint32_t total       = stats.total_advs;
+	uint32_t matched     = stats.matched_advs;
+	uint32_t non_match   = stats.non_matched_advs;
+	uint32_t trunc       = stats.trunc_msd;
+	uint32_t ver_mis     = stats.version_mismatch;
+	uint32_t drops       = stats.queue_drops;
+	uint32_t g_addr      = stats.guard_addr_null;
+	uint32_t g_rssi      = stats.guard_rssi_zero;
+	uint32_t g_buf       = stats.guard_buf_null;
+
+	LOG_INF("--- stats (last %us) ---", SCAN_STATS_PERIOD_SEC);
+	LOG_INF("  advs received:    %u", total);
+	LOG_INF("  matched:          %u", matched);
+	LOG_INF("  non-match:        %u", non_match);
+	LOG_INF("  trunc MSD:        %u", trunc);
+	LOG_INF("  ver mismatch:     %u", ver_mis);
+	LOG_INF("  queue drops:      %u", drops);
+	LOG_INF("  guards (a/r/b):   %u / %u / %u", g_addr, g_rssi, g_buf);
+
+	/* Sanity check: total should equal sum of all workqueue-side
+	 * counters + drops (advs that didn't make it to workqueue).
+	 * If not, there's a bug somewhere.
+	 */
+	uint32_t accounted = matched + non_match + trunc + ver_mis + drops;
+	if (accounted != total) {
+		LOG_WRN("stats mismatch: total=%u accounted=%u (diff=%u)",
+			total, accounted, total - accounted);
+	}
+
+	/* Stack monitoring for the system workqueue thread.
+	 *
+	 * k_thread_stack_space_get: returns 0 on success, -EINVAL if
+	 * CONFIG_THREAD_STACK_INFO is not enabled, errno otherwise.
+	 * free_bytes is the minimum free stack observed since thread
+	 * start (high-water mark). It does NOT go down on allocation,
+	 * only up on stack unwinding - so it's the worst-case usage.
+	 *
+	 * Safe headroom: >256 bytes free is comfortable.
+	 * Caution: 128-256 bytes free - monitor, may need bump.
+	 * Danger: <128 bytes free - bump CONFIG_SYSTEM_WORKQUEUE_STACK_SIZE
+	 *         before adding more work to the workqueue.
+	 */
+	size_t stack_free = 0;
+	int src = k_thread_stack_space_get(&k_sys_work_q.thread, &stack_free);
+	if (src == 0) {
+		LOG_INF("  sysworkq stack:   %u / %u bytes free",
+			stack_free, CONFIG_SYSTEM_WORKQUEUE_STACK_SIZE);
+	} else {
+		LOG_WRN("  stack info unavailable (err=%d) - enable CONFIG_THREAD_STACK_INFO", src);
+	}
+
+	/* Reset counters for next window */
+	stats.total_advs       = 0;
+	stats.matched_advs     = 0;
+	stats.non_matched_advs = 0;
+	stats.trunc_msd        = 0;
+	stats.version_mismatch = 0;
+	stats.queue_drops      = 0;
+	stats.guard_addr_null  = 0;
+	stats.guard_rssi_zero  = 0;
+	stats.guard_buf_null   = 0;
+
+	/* Reschedule ourselves - this is the periodic pattern */
+	k_work_reschedule(&stats_work, K_SECONDS(SCAN_STATS_PERIOD_SEC));
+}
 
 int scan_start(void)
 {
@@ -341,9 +456,6 @@ int scan_start(void)
 	 * If your tree does NOT have BT_LE_SCAN_OPT_NONE defined (very old
 	 * Zephyr), use 0 - the enum value of BT_LE_SCAN_OPT_NONE is literally 0.
 	 *
-	 * Verify on your machine:
-	 *   grep -rn "BT_LE_SCAN_OPT_NONE" /media/rimo/Technical/zephyrproject/zephyr/include/zephyr/bluetooth/
-	 *   grep -rn "bt_le_scan_start"     /media/rimo/Technical/zephyrproject/zephyr/include/zephyr/bluetooth/bluetooth.h
 	 */
 	err = bt_le_scan_start(BT_LE_SCAN_PARAM(BT_LE_SCAN_TYPE_PASSIVE,
 								BT_LE_SCAN_OPT_NONE,
@@ -361,6 +473,11 @@ int scan_start(void)
 		SCAN_INTERVAL, (SCAN_INTERVAL * 5U / 8U),
 		SCAN_WINDOW,   (SCAN_WINDOW   * 5U / 8U),
 		SMART_LOCK_COMPANY_ID);
+
+	/* Schedule first stats dump after the full period - so the first
+	 * dump shows stats accumulated over a full window, not a partial one.
+	 */
+	k_work_reschedule(&stats_work, K_SECONDS(SCAN_STATS_PERIOD_SEC));
 	return 0;
 }
 
@@ -376,6 +493,16 @@ int scan_stop(void)
 		return err;
 	}
 
+	/* Cancel the periodic stats work so it doesn't keep firing after stop */
+	(void)k_work_cancel_delayable(&stats_work);
+
 	LOG_INF("scan stopped");
 	return 0;
+}
+
+void scan_get_stats(struct scan_stats *out)
+{
+	if (out != NULL) {
+		*out = stats;
+	}
 }
