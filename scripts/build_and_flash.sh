@@ -80,6 +80,8 @@ echo "LOG: 4. Flashing firmware..."
 echo "LOG: Flashing successful!"
 
 if [ $START_SCREEN -eq 1 ]; then
+    echo "Waiting for 5 seconds before starting screen monitor .. "
+    sleep 5
     echo "LOG: 5. Starting screen monitor on /dev/ttyACM0 at 115200 baud..."
     # Screen will take over the terminal until you detach or exit.
     screen /dev/ttyACM0 115200
