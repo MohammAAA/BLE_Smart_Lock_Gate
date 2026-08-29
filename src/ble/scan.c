@@ -1,14 +1,7 @@
 /*
  * BLE Smart Lock - Gate Scanner
- * Phase 2 Chapter 4: threading model + stats + drop counters + stack monitor
+ * Phase 3 ch1: feed MATCH into proximity tracking module.
  *
- * Ch4 scope: 
- *   - stats counters (struct scan_stats)
- *   - drop counter in scan_cb (queue_drops)
- *   - guard counters in scan_cb (addr/rssi/buf NULL)
- *   - matched/non_matched/trunc/ver_mismatch counters in workqueue
- *   - periodic stats dump via k_work_delayable
- *   - stack high-water mark via k_thread_stack_space_get
  *
  * Threading model:
  *
@@ -18,13 +11,22 @@
  *   scan_cb  ----k_msgq_put---->   scan_work_handler  ----LOG---->  ring buf -> UART
  *                K_NO_WAIT          k_msgq_get K_NO_WAIT
  *                                    ~50-100us per msg
- *   ~20us per adv (incl. memcpy)
+ *                                   |
+ *                                   +-- proximity_on_match() (Phase 3 ch1)
+ *                                       updates phone registry + state machine
+ *                                   |
+ *                                   +-- proximity_tick_handler (every 1s, Phase 3 ch1)
+ *                                       timeout cleanup + state evolution
+ *                                   |
+ *                                   +-- stats_work_handler (every 10s)
+ *                                       counter dump + stack monitor
  *
  *                                   stats_work_handler (delayable)
  *                                   every 10s: dump counters + stack
 */
 
 #include "scan.h"
+#include "proximity.h"                    /* Phase 3 ch1: phone registry + state machine */
 #include <zephyr/kernel.h>
 #include <zephyr/bluetooth/bluetooth.h>   /* bt_le_scan_start, BT_LE_SCAN_PARAM, BT_DATA_MANUFACTURER_DATA, struct bt_data, bt_data_parse */
 #include <zephyr/bluetooth/addr.h>        /* bt_addr_le_t, bt_addr_le_to_str     */
@@ -221,9 +223,33 @@ static void scan_work_handler(struct k_work *work)
 		 * sometimes use type 3 (NONCONN) for beaconing.
 		 */
 
-		LOG_INF("MATCH: addr=%s rssi=%4d type=%u ver=%u uuid=%s",
-			addr_str, msg.rssi, msg.adv_type, version, uuid_str);
-	}
+                LOG_INF("MATCH: addr=%s rssi=%4d type=%u ver=%u uuid=%s",
+                        addr_str, msg.rssi, msg.adv_type, version, uuid_str);
+
+                /* Phase 3 ch1: feed this MATCH into the proximity tracking
+                 * module. The proximity module handles:
+                 *   - Lookup-or-alloc a phone_track slot by UUID
+                 *   - Update last_rssi, last_match_time, match_count
+                 *   - State machine: ABSENT -> APPROACHING (on first MATCH)
+                 *   - (L4 will add: APPROACHING -> PRESENT on RSSI + dwell)
+                 *
+                 * We pass a pointer to the UUID bytes within the MSD payload
+                 * (ctx.msd_data + MSD_OFFSET_UUID). The proximity module
+                 * copies the UUID into its own phone_track.uuid field, so
+                 * the pointer does not need to remain valid after this call.
+                 *
+                 * Return value is the slot index (0..7) on success, or
+                 * -ENOSPC if registry full (logged at WRN inside the call).
+                 * We don't act on the return value here -- the proximity
+                 * module handles all state logic. We just feed it data.
+                 *
+                 * Threading: this runs in scan_work_handler (system workqueue).
+                 * proximity_on_match also runs in system workqueue. No
+                 * locking needed.
+                 */
+                (void)proximity_on_match(&ctx.msd_data[MSD_OFFSET_UUID],
+                                         msg.rssi);
+        }
 }
 
 /* K_WORK_DEFINE declares a static k_work item bound to scan_work_handler.

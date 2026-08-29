@@ -23,7 +23,8 @@
 #include <zephyr/bluetooth/bluetooth.h>
 #include <zephyr/bluetooth/hci.h>
 #include <stdio.h>
-#include "ble/scan.h" 
+#include "ble/scan.h"
+#include "ble/proximity.h"           /* Phase 3 ch1: phone registry + state machine */
 
 LOG_MODULE_REGISTER(main, LOG_LEVEL_INF); // LOG_INF("TEXT"); --> becomes "INF main: TEXT"
 
@@ -97,6 +98,22 @@ static void bt_ready_cb(int err)
     /* Kick off passive scan */
     LOG_INF("BLE ready, starting scan ...");
     scan_start();
+
+    /* Phase 3 ch1: initialize the phone-tracking registry + schedule the
+     * 1-second proximity tick. Must come AFTER scan_start() so that if a
+     * phone happens to be advertising the moment BLE comes up, the scan is
+     * already running and MATCHes will flow into proximity_on_match.
+     *
+     * proximity_init() zeros the phones[] array and schedules the first
+     * proximity_tick for 1 second from now. Idempotent -- safe to call
+     * multiple times.
+     *
+     * Threading note: this runs in BT RX context (bt_ready_cb is called by
+     * the BT stack on the BT RX thread). proximity_init just calls memset +
+     * k_work_reschedule, both of which are safe in BT RX context. The
+     * actual proximity_tick runs in the system workqueue.
+     */
+    proximity_init();
 }
 
 int main(void)
