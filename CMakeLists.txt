@@ -5,6 +5,7 @@ project(smart_lock_gate)
 target_sources(app PRIVATE
 src/main.c
 src/ble/scan.c
+src/ble/proximity.c
 )
 target_include_directories(app PRIVATE
     src
