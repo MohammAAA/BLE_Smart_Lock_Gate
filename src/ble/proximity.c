@@ -11,7 +11,26 @@
  *   - proximity_tick: 30s timeout cleanup + DBG state log
  *   - All transitions logged at INF for audit
  *
- * Threading (carried from Phase 2 L4):
+ * Phase 3 ch2 changes:
+ *   1. kalman_update(): time-normalized scalar Kalman filter
+ *      (design addendum 3-L1-A point (ii)):
+ *        - dt from k_uptime timestamps, q_step = Q_PER_SEC * dt
+ *        - first sample after alloc: x0 = z0, p0 = r (no convergence wait)
+ *   2. fmt_float2(): fixed-point float formatting for logs (no
+ *      CONFIG_CBPRINTF_FP_SUPPORT, no libm -- no roundf/fabsf anywhere)
+ *   3. proximity_on_match(): feeds each MATCH through kalman_update
+ *      BEFORE updating last_match_time/match_count (ordering matters!)
+ *   4. proximity_tick(): DBG snapshot now includes kalman_x / kalman_p
+ *
+ * Float discipline (Cortex-M4F, single-precision FPv4 FPU):
+ *   - float only, never double; ALL float constants f-suffixed
+ *   - CONFIG_FPU=y in prj.conf (hard-float ABI for the whole build)
+ *     executes FP math (on_match + tick handlers). Turn FP_SHARING on
+ *     only if a second thread ever executes float code.
+ *   - No FP in ISRs (unsupported on ARMv7-M in Zephyr) -- both FP paths
+ *     run in thread (workqueue) context, verified.
+ *
+ * Threading (carried from Phase 2 ch4):
  *   - proximity_on_match runs in scan_work_handler (system workqueue)
  *   - proximity_tick runs in its own k_work_delayable (also system workqueue)
  *   - System workqueue is single-threaded -> no locking on phones[]
@@ -124,9 +143,10 @@ static int find_free_slot(void)
  *     APPROACHING)
  *   - last_rssi, match_count, last_match_time, state_enter_time: 0 from
  *     memset (will be set by caller)
- *   - kalman_x, kalman_p: 0.0 (L2 will initialize properly)
- *   - rssi_buf: zeroed (L3 will populate)
- *   - smoothed_buf: zeroed (L3 will populate)
+ *   - kalman_x, kalman_p: 0.0 from memset -- kalman_update initializes
+ *     them to (x0=z0, p0=r) on the first MATCH (match_count==0 sentinel)
+ *   - rssi_buf: zeroed (ch3 will populate)
+ *   - smoothed_buf: zeroed (ch3 will populate)
  *
  * We memset the whole struct first (cheap, gets all padding too) then set
  * the fields we need. This is safer than partial init (no uninitialized
@@ -225,6 +245,143 @@ static void transition_phone(int slot, uint8_t new_state)
             phone_state_name[new_state]);
 }
 
+/* --- Kalman filter (Phase 3 ch2) ---------------------------------------- */
+
+/*
+ * fmt_float2: format a float as "[-]d.dd" into a caller buffer.
+ * (Phase 3 ch2)
+ *
+ * Why not LOG_DBG("... %f ..."): %f in Zephyr logging requires
+ * CONFIG_CBPRINTF_FP_SUPPORT=y, which pulls in substantial code. Why not
+ * roundf()/fabsf(): those are libm calls (dependency + call overhead).
+ * This helper is pure integer formatting after ONE manual rounding step
+ * -- production-free, zero dependencies.
+ *
+ * Method: round to hundredths with sign-adjusted truncation (adding +0.5
+ * for v>=0 and -0.5 for v<0 makes C's toward-zero truncation round to
+ * nearest instead of flooring negatives), then print integer parts.
+ * Examples: -58.37 -> "-58.37", 0.678 -> "0.67", -0.5 -> "-0.50".
+ *
+ * Inputs are bounded (|x| <= 128 dBm, p <= ~64 dB^2, k in [0,1]), so
+ * cents fits comfortably in int32_t. No overflow possible.
+ */
+static void fmt_float2(char *out, size_t len, float v)
+{
+    if (out == NULL || len < 9U) {
+        return;  /* "-100.00" + NUL = 8; 9 gives margin. Caller error. */
+    }
+
+    int32_t cents = (int32_t)(v * 100.0f + (v >= 0.0f ? 0.5f : -0.5f));
+    int32_t whole = cents / 100;
+    int32_t frac  = cents % 100;
+
+    if (cents < 0) {
+        (void)snprintk(out, len, "-%d.%02d", (int)(-whole), (int)(-frac));
+    } else {
+        (void)snprintk(out, len, "%d.%02d", (int)whole, (int)frac);
+    }
+}
+
+/*
+ * kalman_update: feed one MATCH's RSSI into the slot's scalar Kalman filter.
+ * (Phase 3 ch2; implements design addendum 3-L1-A point (ii).)
+ *
+ * Called from proximity_on_match ONLY (system workqueue thread), and it
+ * must run BEFORE last_match_time / match_count are updated -- it needs
+ * the PREVIOUS values for dt and for first-sample detection.
+ *
+ * Model (deliberately the simplest useful one -- "random walk + noise"):
+ *
+ *   true state : x_k = x_{k-1} + w_k,  w ~ N(0, Q_PER_SEC * dt)   [predict]
+ *   measurement: z_k = x_k + v_k,      v ~ N(0, R)                [update]
+ *
+ * This IS the textbook Kalman with F=1, H=1 (scalar, no dynamics) -- no
+ * matrices needed. No motion model on purpose: at 1-4 m gate range,
+ * multipath makes RSSI-vs-distance too ambiguous to "predict where the
+ * RSSI is going"; we only model "it drifts, and drift accumulates with
+ * TIME".
+ *
+ * Units: x in dBm, p in dB^2, dt in seconds.
+ *
+ * Why no NaN/overflow guards: z is a bounded int8_t, all parameters are
+ * positive finite floats, and the recursion only uses +,-,*,/ -- with
+ * finite inputs the state cannot become NaN or infinite. Guards-by-design
+ * beats defensive runtime checks (nothing to check, nothing to branch on).
+ */
+static void kalman_update(int slot, int8_t z, int64_t now_ms)
+{
+    struct phone_track *ph = &phones[slot];
+
+    /*
+     * First sample after alloc: start the filter AT the measurement
+     * (addendum 3-L1-A: x0 = z0, p0 = r). The estimate is exactly as good
+     * as one raw sample -- because it IS one raw sample. No convergence
+     * wait on the critical path.
+     *
+     * match_count == 0 is a reliable "not yet initialized" sentinel:
+     * alloc_phone memsets the slot, and alloc + first feed happen inside
+     * the same proximity_on_match call, so this branch fires exactly once
+     * per slot lifetime (match_count is only 0 between memset and the
+     * first increment, which brackets this call).
+     */
+    if (ph->match_count == 0U) {
+        ph->kalman_x = (float)z;
+        ph->kalman_p = PROX_KALMAN_R;
+        return;
+    }
+
+    /*
+     * dt from wall-clock timestamps -- NEVER from sample counts (the
+     * whole point of addendum 3-L1-A). Range: 0 .. ~31 s (30 s timeout
+     * + up to 1 s tick latency). Even a grossly larger dt stays graceful:
+     * p grows, k -> 1, next sample snaps the estimate -- correct
+     * semantics for "phone was gone a long time".
+     *
+     * dt == 0 (two MATCHes in the same millisecond -- possible during
+     * scan-window bursts) is legal: predict adds zero process noise, and
+     * the update still validly averages two same-instant measurements.
+     * Nothing anywhere divides by dt, so there is nothing to blow up.
+     *
+     * Precision: |dt| < 2^24 ms is exact in float; our max is ~31000 ms.
+     * (dt_s values like 2.857 are inexact by <1 ulp -- irrelevant at
+     * dB^2/s scale.)
+     */
+    float dt_s = (float)(now_ms - ph->last_match_time) / 1000.0f;
+
+    /* --- Predict: time advanced, no new information yet ---------------- */
+    /* x_pred = x          (random walk: no direction to extrapolate)      */
+    /* p_pred = p + q*dt   (uncertainty grows linearly with elapsed time)  */
+    float p_pred = ph->kalman_p + PROX_KALMAN_Q_PER_SEC * dt_s;
+
+    /* --- Update: blend prediction with measurement ----------------------
+     *
+     * Optimal gain for combining two unbiased estimates (prediction with
+     * variance p_pred, measurement with variance r): the minimum-variance
+     * blend weight. k -> 1: trust the measurement (prediction is vague).
+     * k -> 0: trust the prediction (measurement is noisy).
+     *
+     * All-float with f-suffixed constants -- a single bare `2.0`/`4.0`
+     * anywhere here promotes that expression to software double (ch2
+     * lesson part 2; objdump evidence in the lab section).
+     */
+    float k = p_pred / (p_pred + PROX_KALMAN_R);
+
+    ph->kalman_x += k * ((float)z - ph->kalman_x);
+    ph->kalman_p  = (1.0f - k) * p_pred;
+
+    /*
+     * Per-MATCH tuning view (DBG only): the five numbers you stare at
+     * while tuning q/r. Enable with CONFIG_LOG_DEFAULT_LEVEL=4.
+     * (dt printed as int ms: bounded by ~31000, fits comfortably.)
+     */
+    char xs[12], ps[12], ks[12];
+    fmt_float2(xs, sizeof(xs), ph->kalman_x);
+    fmt_float2(ps, sizeof(ps), ph->kalman_p);
+    fmt_float2(ks, sizeof(ks), k);
+    LOG_INF("kalman: slot=%d z=%d dt=%dms k=%s x=%s p=%s",
+            slot, z, (int)(now_ms - ph->last_match_time), ks, xs, ps);
+}
+
 /* --- Periodic tick ---------------------------------------------------- */
 
 static void proximity_tick_handler(struct k_work *work);
@@ -288,9 +445,18 @@ static void proximity_tick_handler(struct k_work *work)
          * stable. Turn back to 3 for normal runs.
          */
         int64_t time_in_state = now - phones[i].state_enter_time;
-        LOG_DBG("tick: slot=%d state=%s rssi=%d matches=%u age=%lldms in_state=%lldms",
+
+        /* Phase 3 ch2: Kalman estimate + variance in the per-tick snapshot.
+         * fmt_float2 avoids CONFIG_CBPRINTF_FP_SUPPORT.
+         */
+        char xs[12], ps[12];
+        fmt_float2(xs, sizeof(xs), phones[i].kalman_x);
+        fmt_float2(ps, sizeof(ps), phones[i].kalman_p);
+
+        LOG_INF("tick: slot=%d state=%s rssi=%d kalman_x=%s p=%s "
+                "matches=%u age=%lldms in_state=%lldms",
                 i, phone_state_name[phones[i].state],
-                phones[i].last_rssi, phones[i].match_count,
+                phones[i].last_rssi, xs, ps, phones[i].match_count,
                 (long long)since_match, (long long)time_in_state);
     }
 
@@ -311,7 +477,7 @@ int proximity_init(void)
      * scheduled, it reschedules to the new time. Safe to call multiple times.
      */
     int rc = k_work_reschedule(&proximity_tick_work, K_MSEC(PROX_TICK_MS));
-    if (rc != 0) {
+    if (rc < 0) {
         LOG_ERR("proximity_init: k_work_reschedule failed: %d", rc);
         return rc;
     }
@@ -345,12 +511,26 @@ int proximity_on_match(const uint8_t *uuid, int8_t rssi)
         }
     }
 
-    /* 2. Update per-MATCH fields */
+    /* 2. Kalman update (Phase 3 ch2)
+     *
+     * ORDER MATTERS: kalman_update must run BEFORE last_match_time and
+     * match_count are overwritten below -- it computes dt from the
+     * PREVIOUS last_match_time, and uses match_count==0 to detect the
+     * first sample after alloc. (Swapping this order is ch2 exercise Q4.)
+     *
+     * One k_uptime_get() for the whole MATCH: dt, last_match_time, and
+     * state_enter_time (via transition_phone below) all see the same
+     * "now", so logs and math stay mutually consistent.
+     */
+    int64_t now = k_uptime_get();
+    kalman_update(slot, rssi, now);
+
+    /* 3. Update per-MATCH fields */
     phones[slot].last_rssi        = rssi;
-    phones[slot].last_match_time = k_uptime_get();
+    phones[slot].last_match_time = now;
     phones[slot].match_count++;
 
-    /* 3. State machine: ABSENT -> APPROACHING on first MATCH
+    /* 4. State machine: ABSENT -> APPROACHING on first MATCH
      *
      * For a newly-allocated slot, state is ABSENT (set in alloc_phone).
      * For an existing slot that timed out and was freed, alloc_phone also

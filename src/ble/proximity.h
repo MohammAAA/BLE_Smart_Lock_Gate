@@ -5,25 +5,31 @@
  * BLE Smart Lock - Proximity Tracking
  * Phase 3 Lesson 1: phone-tracking registry + state machine skeleton
  *
- * L1 scope:
+ * ch1 scope:
  *   - phone_track struct (per-tracked-phone state)
  *   - Registry: array of MAX_TRACKED_PHONES slots, alloc/free/lookup-by-UUID
  *   - State machine enum: ABSENT -> APPROACHING -> PRESENT -> DEPARTING -> ABSENT
- *   - Real transitions in L1: ABSENT->APPROACHING (on first MATCH), Any->ABSENT
+ *   - Real transitions in ch1: ABSENT->APPROACHING (on first MATCH), Any->ABSENT
  *     (30s timeout)
- *   - Stub transitions (L4 will fill): APPROACHING->PRESENT (dwell+RSSI),
+ *   - Stub transitions (ch4 will fill): APPROACHING->PRESENT (dwell+RSSI),
  *     PRESENT->DEPARTING, DEPARTING->ABSENT
  *   - 1-second proximity_tick via k_work_delayable (state evolution + cleanup)
  *   - All state transitions logged at INF for audit
  *
- * What is NOT in L1 (comes in later lessons):
- *   - L2: Kalman filter (kalman_x, kalman_p fields are in struct but not
- *        populated yet)
- *   - L3: Ring buffer population + moving average + trend slope
- *         (rssi_buf / smoothed_buf fields are in struct but not populated yet)
- *   - L4: RSSI threshold + dwell timers driving APPROACHING->PRESENT,
- *         PRESENT->DEPARTING, DEPARTING->ABSENT
- *   - L5: Asymmetric scan (modifies scan_start to accept per-state params)
+ * Lesson status:
+ *   ch1: registry + state machine skeleton (delivered)
+ *   ch2: time-normalized scalar Kalman filter (delivered -- PROX_KALMAN_*
+ *       tunables below; kalman_x/kalman_p populated on every MATCH).
+ *       Design addendum 3-L1-A rule: ALL filters are TIME-based, never
+ *       sample-index-based.
+ *   - ch3 (pending): ring buffer + moving average + trend slope
+ *         (rssi_buf / smoothed_buf fields are in struct but not populated
+ *         yet; trend = time-window LSQ on decimated (x,t) pairs)
+ *   - ch4 (pending): RSSI threshold + dwell timers driving
+ *         APPROACHING->PRESENT, PRESENT->DEPARTING, DEPARTING->ABSENT
+ *   - ch5 (pending): asymmetric scan (modifies scan_start to accept
+ *         per-state params; scan duty is a latency/energy/spectrum knob
+ *         only -- never a correctness knob, addendum 3-L1-A (vi))
  *
  * Threading model (carried from Phase 2 L4):
  *   - proximity_on_match() runs in scan_work_handler context (system workqueue)
@@ -80,16 +86,23 @@
  * If no MATCH is received from a tracked phone for this long, the phone is
  * considered gone: state -> ABSENT, slot freed, Kalman state discarded.
  *
- * Why 30 seconds:
- *   - At 1 Hz phone advertising + 100ms scan window, expected match rate is
- *     ~0.35 matches/s (see Phase 2 L4/L5 derivation). So in 30s we expect
- *     ~10 matches.
- *   - Missing 10 consecutive matches has probability (1 - 0.35)^10 = 1.3%.
- *     So 30s timeout has ~1.3% false-positive rate (phone still there but
- *     we declare it gone).
- *   - Shorter timeout (e.g., 10s) would have ~3.5% false-positive rate.
- *   - Longer timeout (e.g., 60s) wastes registry slots for gone phones.
- *   - 30s is the sweet spot.
+ * Why 30 seconds (math corrected in the L1 addendum review, worklog 3-L1-A;
+ * the original comment used the wrong exponent and mixed up models):
+ *   - Model: the phone advertises ~1 event/s; each adv event is caught
+ *     with probability ~0.35 (Phase 2 ch4 empirical: 3-4 matches per 10s
+ *     with window=160/interval=400 = 100/250 ms = 40% duty, minus losses).
+ *     Over 30s that is ~30 independent catch opportunities, ~10-12 expected
+ *     matches.
+ *   - P(0 matches in 30s) = (1 - 0.35)^30 = 2.4e-6, about 1 in 400,000.
+ *     The statistical false-positive of the timeout (phone still
+ *     advertising but we declare it gone) is negligible.
+ *   - P(0 matches in 10s) = 0.65^10 = 1.4% (the old comment said 1.3% for
+ *     30s and 3.5% for 10s -- both wrong: 1.3% IS the 10s figure).
+ *   - So 30s is NOT a statistics-driven choice; it is a UX/robustness
+ *     choice: bridge brief disappearances (pocket fades, Android doze
+ *     throttling advertising below 1 Hz, app hiccups) while still freeing
+ *     slots reasonably fast. 60s would hold slots twice as long for a
+ *     statistical benefit we do not need.
  *
  * Trade-off: when a phone leaves and comes back within 30s, the slot is still
  * reserved and Kalman state is preserved (fast re-convergence, good UX).
@@ -128,6 +141,45 @@
  */
 #define PROX_TICK_MS 1000
 
+/* --- Kalman filter tunables (Phase 3 cg2) ------------------------------- */
+
+/*
+ * Process noise: how much the "true RSSI" may drift per second, dB^2/s.
+ * This is the TIME-NORMALIZED q of design addendum 3-L1-A: per-step
+ * process noise is q_step = Q_PER_SEC * dt, with dt computed from
+ * k_uptime timestamps of consecutive MATCHes -- NEVER from sample counts.
+ * Consequence: the filter behaves consistently in TIME at any observed
+ * sample rate (0.35 Hz pocket-at-40%-duty, 1 Hz pocket-at-100%-duty,
+ * 10 Hz Phase-6 app) with zero retuning.
+ *
+ * Physical grounding (calm indoor walk):
+ *   - person walks ~1 m/s; at 1-4 m gate range the log-distance path-loss
+ *     slope is ~2.5 dB per meter (20*log10(d2/d1), exponent n ~ 2-3)
+ *   - so true RSSI drifts ~1-2.5 dB/s -> variance ~1-6 dB^2/s
+ *   - Q_PER_SEC = 2.0 (sigma ~1.4 dB/s) sits mid-band for a calm walk
+ *
+ * Tune UP (4-8): DBG logs show kalman_x lagging a walking person by >3 dB.
+ * Tune DOWN (0.5-1): DBG logs show kalman_x jumping on every multipath
+ * outlier while the phone is stationary.
+ *
+ * Steady state for constant dt (per-update q_step = Q_PER_SEC*dt, r):
+ *   p_ss = (-q_step + sqrt(q_step^2 + 4*q_step*r)) / 2
+ *   K_ss = (p_ss + q_step) / (p_ss + q_step + r)
+ * Derivation + operating-point table in the ch2 lesson.
+ */
+#define PROX_KALMAN_Q_PER_SEC 1.0f
+
+/*
+ * Measurement noise: variance of ONE RSSI reading, dB^2. r = 4.0 means
+ * sigma_z = 2 dB -- the empirical jitter of a single BLE adv RSSI report
+ * from a stationary phone (Phase 2 logs showed +/-3-5 dB swings, which
+ * for roughly-Gaussian noise is ~2 sigma).
+ *
+ * Per-OBSERVATION, not per-second: a noisy measurement is noisy no matter
+ * when it arrives. Only the process noise is time-normalized.
+ */
+#define PROX_KALMAN_R 4.0f
+
 /* --- State machine ---------------------------------------------------- */
 
 /*
@@ -141,12 +193,18 @@
  *               no timers.
  *
  *   APPROACHING Phone has been seen (at least one MATCH). Kalman is converging.
- *               Scan switches to 100% duty (L5) to speed up convergence.
- *               In L1: we ENTER this state on first MATCH and stay here.
- *               In L4: we EXIT to PRESENT when RSSI > -58 dBm sustained >3s.
+ *               Scan switches to 100% duty (ch5): catch EVERY advertisement.
+ *               (Normalization note, worklog 3-L1-A: sample rate is set by
+ *               the phone's adv rate -- 1 Hz in pocket, ~10 Hz with the
+ *               Phase 6 app. 100% duty removes OUR 60% drop rate; it does
+ *               not add samples.)
+ *               In ch1: we ENTER this state on first MATCH and stay here.
+ *               In ch4: we EXIT to PRESENT when RSSI > -58 dBm sustained >3s.
  *
  *   PRESENT     Phone is close (RSSI > -58 dBm sustained). UNLOCK fires on
- *               entry to this state. Scan returns to 25% duty (L5).
+ *               entry to this state. Scan returns to slow duty (ch5; current
+ *               params 160/400 units = 100/250 ms = 40% duty, not 25% --
+ *               the old label divided a ms window by a unit interval).
  *               In L1: never entered (transition is L4 work).
  *               In L4: we EXIT to DEPARTING when RSSI < -75 dBm sustained >5s.
  *
@@ -236,7 +294,12 @@ struct phone_track {
     int64_t  last_match_time;      /* k_uptime_get() at last MATCH, ms */
     int64_t  state_enter_time;     /* k_uptime_get() at state entry, ms */
 
-    /* --- Kalman state (L2 populates) --- */
+    /* --- Kalman state (populated since ch2, on every MATCH) --- */
+    /* x: estimate of the phone's true RSSI right now, dBm.
+     * p: variance of that estimate, dB^2 (NOT sigma -- sigma = sqrt(p)).
+     * Populated by kalman_update() in proximity.c; see PROX_KALMAN_*
+     * tunables above for the model and units.
+     */
     float    kalman_x;             /* current estimate (smoothed RSSI) */
     float    kalman_p;             /* current uncertainty (variance) */
 
