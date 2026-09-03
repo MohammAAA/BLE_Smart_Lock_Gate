@@ -22,9 +22,13 @@
  *       tunables below; kalman_x/kalman_p populated on every MATCH).
  *       Design addendum 3-L1-A rule: ALL filters are TIME-based, never
  *       sample-index-based.
- *   - ch3 (pending): ring buffer + moving average + trend slope
- *         (rssi_buf / smoothed_buf fields are in struct but not populated
- *         yet; trend = time-window LSQ on decimated (x,t) pairs)
+ *   ch3: trend (delivered -- TREND_* tunables below): decimated (x,t) ring
+ *       of Kalman outputs + 5 s time-window LSQ slope with evidence
+ *       guards + 3-sigma innovation gate on the Kalman. Fixes Issue #3
+ *       (trend input is smoothed values, never raw RSSI). The 12 s MA
+ *       from the original plan: DROPPED (the LSQ is itself a smoother;
+ *       a series MA would add ~5.5 s slope-onset lag -- analysis and
+ *       falsification criterion in the L3 lesson).
  *   - ch4 (pending): RSSI threshold + dwell timers driving
  *         APPROACHING->PRESENT, PRESENT->DEPARTING, DEPARTING->ABSENT
  *   - ch5 (pending): asymmetric scan (modifies scan_start to accept
@@ -141,7 +145,7 @@
  */
 #define PROX_TICK_MS 1000
 
-/* --- Kalman filter tunables (Phase 3 cg2) ------------------------------- */
+/* --- Kalman filter tunables (Phase 3 ch2) ------------------------------- */
 
 /*
  * Process noise: how much the "true RSSI" may drift per second, dB^2/s.
@@ -179,6 +183,87 @@
  * when it arrives. Only the process noise is time-normalized.
  */
 #define PROX_KALMAN_R 4.0f
+
+/* --- Trend tunables (Phase 3 ch3) ---------------------------------------- */
+
+/*
+ * TREND_RING_N: decimated (x, t) entries kept per phone.
+ *
+ * Sizing: the slope uses a TREND_WINDOW_MS window, decimation inserts at
+ * most one entry per TREND_DECIMATE_MS, so the window can hold at most
+ * 5000/500 + 1 = 11 boundary points; the ring keeps the last 10, which
+ * spans the whole window at the fastest legal decimated rate (2 Hz).
+ * Slower input rates leave the ring partially full -- older entries are
+ * simply filtered out at compute time by the age check.
+ *
+ * RAM: (4 + 4) bytes * 10 = 80 bytes/slot.
+ */
+#define TREND_RING_N 10
+
+/*
+ * TREND_DECIMATE_MS: minimum spacing between ring entries (500 ms).
+ *
+ * One entry per >= 500 ms, per design addendum 3-L1-A (iii). Skipping
+ * faster samples loses NOTHING: the Kalman has already fused them into
+ * kalman_x; the ring stores the trajectory of the ESTIMATE, not raw
+ * observations. Decimation makes the structure rate-independent: 10
+ * entries always span >= 5 s, whether MATCHes arrive at 0.35 Hz (pocket
+ * at 40% scan duty) or 10 Hz (Phase 6 app).
+ *
+ * 500 ms = TREND_WINDOW_MS / TREND_RING_N: the minimum spacing that lets
+ * 10 entries cover the 5 s window.
+ */
+#define TREND_DECIMATE_MS 500
+
+/*
+ * TREND_WINDOW_MS: the LSQ slope is fitted over entries younger than
+ * this. Rolling window anchored at NOW (not at the newest entry!), so
+ * stale entries age out and a silent phone self-invalidates its trend
+ * within ~5 s.
+ *
+ * Why 5 s (addendum (iii)): matches the dwell timescale (3 s unlock /
+ * 5 s relock). A longer window lowers slope noise but slows the
+ * response to a direction CHANGE (full refresh takes ~W/2 after the
+ * change). At this window: sigma_slope ~ 0.25-0.4 dB/s vs a walking
+ * person's ~2.5 dB/s (SNR ~7-10; numbers in the L3 lesson Q1).
+ */
+#define TREND_WINDOW_MS 5000
+
+/*
+ * Trend guards: the slope is claimed VALID only with enough evidence.
+ * Fewer than TREND_MIN_POINTS points in the window, or a span shorter
+ * than TREND_MIN_SPAN_MS, yields trend_valid=0 (i.e.: INVALID) / slope=0.0f -- "no
+ * direction claim", NOT "stationary". ALWAYS check trend_valid before
+ * using trend_slope.
+ *
+ * Why guards matter: with 2 points the "slope" is a single difference
+ * (pure noise); with 3 close points the regression denominator is tiny
+ * and the slope explodes. The guards are an evidence threshold, not an
+ * edge-case patch.
+ */
+#define TREND_MIN_POINTS 4
+#define TREND_MIN_SPAN_MS 2000
+
+/*
+ * PROX_KALMAN_GATE_SIGMA: innovation (outlier) gate width, in sigmas.
+ *
+ * The innovation (z - x) is the filter's own prediction residual; its
+ * variance is p_pred + r. A residual beyond PROX_KALMAN_GATE_SIGMA
+ * sigmas is REJECTED: x keeps the predict step only (p = p_pred, time
+ * still passed). The caller still stamps last_match_time, so time
+ * accounting stays honest.
+ *
+ * Why: single-sample multipath spikes (the -76-among--65s excursion in
+ * the L2 desk capture) are the #1 corruptor of LSQ slopes -- one 13 dB
+ * point among 5 can fake ~1-2 dB/s of slope. A spike never persists, so
+ * it never gets in. A GENUINE persistent level shift self-opens the
+ * gate: each rejection leaves p = p_pred, so the threshold widens every
+ * sample (accept after ~3 rejections at 1 Hz).
+ *
+ * Set to 0.0f to disable (e.g. if walk tests show lag on fast genuine
+ * changes). Full trace in the L3 lesson Q3.
+ */
+#define PROX_KALMAN_GATE_SIGMA 3.0f
 
 /* --- State machine ---------------------------------------------------- */
 
@@ -268,8 +353,11 @@ extern const char *const phone_state_name[4];
  * Threading: only the system workqueue touches this struct (via
  * proximity_on_match and proximity_tick). No locking needed.
  *
- * Fields marked "(L2)" or "(L3)" are declared now to avoid struct refactoring
- * later, but are not populated until those lessons.
+ * Layout (Phase 3 ch3): fields are ordered largest-alignment-first, which
+ * eliminates ALL padding: sizeof = 136 bytes/slot exactly (was 112 with
+ * the ch1 fields; the growth is the 80-byte trend ring). 8 slots = 1088
+ * bytes total -- still trivial vs 256 KB RAM. Offset table inside the
+ * struct; verified by BUILD_ASSERT in proximity.c.
  *
  * Note on last_match_time vs. handoff's last_match_age:
  *   The handoff document (section 7.4) specified last_match_age as a uint32_t
@@ -283,35 +371,62 @@ extern const char *const phone_state_name[4];
  *   traceability.
  */
 struct phone_track {
-    /* --- Identity (set on alloc, never changed) --- */
-    uint8_t  uuid[MSD_LEN_UUID];   /* 16 bytes, network order (RFC 4122) */
-    bool     in_use;               /* slot occupancy flag */
+    /*
+     * Offset table (Phase 3 ch3 ordering, zero padding -- we verify with the
+     * BUILD_ASSERT in proximity.c):
+     *
+     *   0   last_match_time   int64_t  (8)
+     *   8   state_enter_time  int64_t  (8)
+     *   16  match_count       uint32_t (4)
+     *   20  kalman_x          float    (4)
+     *   24  kalman_p          float    (4)
+     *   28  trend_x[10]       float    (40)
+     *   68  trend_t[10]       uint32_t (40)
+     *   108 trend_slope       float    (4)
+     *   112 kalman_gated      uint16_t (2)
+     *   114 uuid[16]          uint8_t  (16)
+     *   130 in_use            bool     (1)
+     *   131 state             uint8_t  (1)
+     *   132 last_rssi         int8_t   (1)
+     *   133 trend_head        uint8_t  (1)
+     *   134 trend_count       uint8_t  (1)
+     *   135 trend_valid       uint8_t  (1)
+     *   ---- sizeof = 136 (alignment 8, multiple of 8) ----
+     */
 
-    /* --- Current state (updated on transitions) --- */
-    uint8_t  state;                /* enum phone_state, current */
-    int8_t   last_rssi;            /* most recent RSSI from MATCH, dBm */
-    uint32_t match_count;          /* total MATCHes since alloc (for debug) */
+    /* --- Match + state timing --- */
     int64_t  last_match_time;      /* k_uptime_get() at last MATCH, ms */
     int64_t  state_enter_time;     /* k_uptime_get() at state entry, ms */
 
-    /* --- Kalman state (populated since ch2, on every MATCH) --- */
-    /* x: estimate of the phone's true RSSI right now, dBm.
-     * p: variance of that estimate, dB^2 (NOT sigma -- sigma = sqrt(p)).
-     * Populated by kalman_update() in proximity.c; see PROX_KALMAN_*
-     * tunables above for the model and units.
+    /* --- Kalman filter (populated since L2, on every MATCH) --- */
+    uint32_t match_count;          /* total MATCHes since alloc (debug) */
+    float    kalman_x;             /* estimate of true RSSI now, dBm */
+    float    kalman_p;             /* variance of estimate, dB^2 */
+
+    /* --- Trend (L3): decimated (x, t) ring + LSQ slope --- */
+    /* trend_x/trend_t: trajectory of the Kalman ESTIMATE (Issue #3 fix:
+     * never raw RSSI), one entry per >= TREND_DECIMATE_MS. trend_t holds
+     * (uint32_t)k_uptime ms: truncation wraps every 49.7 days, but every
+     * use computes spans as (int32_t)(t_new - t_old), which is exact for
+     * true spans < 24.8 days -- ours are <= 5 s, so the wrap is invisible.
      */
-    float    kalman_x;             /* current estimate (smoothed RSSI) */
-    float    kalman_p;             /* current uncertainty (variance) */
+    float    trend_x[TREND_RING_N];
+    uint32_t trend_t[TREND_RING_N];
+    /* Slope in dB/s: positive = RSSI rising = approaching, negative =
+     * receding. Meaningful ONLY when trend_valid == 1: slope == 0.0f with
+     * trend_valid == 0 means "no direction claim", NOT "stationary".
+     */
+    float    trend_slope;
+    uint16_t kalman_gated;         /* MATCHes rejected by the 3-sigma gate */
 
-    /* --- Ring buffer of raw RSSI (L3 populates) --- */
-    int8_t   rssi_buf[32];         /* 32 samples = 32s history at 1 Hz */
-    uint8_t  rssi_buf_head;        /* next write index */
-    uint8_t  rssi_buf_count;      /* valid entries (0..32) */
-
-    /* --- Smoothed-value ring for trend (L3 populates, fixes Issue #3) --- */
-    float    smoothed_buf[5];      /* last 5 Kalman outputs for trend slope */
-    uint8_t  smoothed_head;
-    uint8_t  smoothed_count;
+    /* --- Identity + small fields --- */
+    uint8_t  uuid[MSD_LEN_UUID];   /* 16 bytes, network order (RFC 4122) */
+    bool     in_use;               /* slot occupancy flag */
+    uint8_t  state;                /* enum phone_state, current */
+    int8_t   last_rssi;            /* most recent RSSI from MATCH, dBm */
+    uint8_t  trend_head;           /* next write index in the trend rings */
+    uint8_t  trend_count;          /* valid entries, 0..TREND_RING_N */
+    uint8_t  trend_valid;          /* 1 = slope passed the evidence guards */
 };
 
 /* --- Public API ------------------------------------------------------- */

@@ -22,11 +22,31 @@
  *      BEFORE updating last_match_time/match_count (ordering matters!)
  *   4. proximity_tick(): DBG snapshot now includes kalman_x / kalman_p
  *
+ * Phase 3 ch3 changes (search for "Phase 3 ch3"):
+ *   1. trend_push(): decimated (x, t) insertion on every MATCH
+ *      (>= TREND_DECIMATE_MS apart; stores kalman_x -- the ESTIMATE
+ *      trajectory, which is the Issue #3 fix: never raw RSSI)
+ *   2. trend_compute(): LSQ slope in dB/s over the 5 s time window,
+ *      guards (>= TREND_MIN_POINTS, >= TREND_MIN_SPAN_MS) else INVALID;
+ *      runs in the 1 s tick; window anchored at NOW so a silent phone
+ *      self-invalidates within ~5 s (honesty, not a bug)
+ *   3. 3-sigma innovation gate in kalman_update (PROX_KALMAN_GATE_SIGMA;
+ *      squared comparison, no sqrtf; rejection keeps p = p_pred so the
+ *      gate self-opens on genuine persistent level shifts)
+ *   4. struct phone_track re-laid-out: raw rssi_buf[32] and
+ *      smoothed_buf[5] DELETED (superseded by the decimated ring);
+ *      zero-padding field order, 112 -> 136 bytes/slot; BUILD_ASSERT
+ *      verifies the documented layout
+ *   5. tick DBG now includes slope (or INVALID) + gated count
+ *
  * Float discipline (Cortex-M4F, single-precision FPv4 FPU):
  *   - float only, never double; ALL float constants f-suffixed
  *   - CONFIG_FPU=y in prj.conf (hard-float ABI for the whole build)
- *     executes FP math (on_match + tick handlers). Turn FP_SHARING on
- *     only if a second thread ever executes float code.
+ *   - FP_SHARING: Zephyr 4.4 turns it on automatically when FPU=y (verified
+ *     in the student's generated .config -- L2 review catch). That is good:
+ *     FPU registers are saved across context switches with LAZY stacking,
+ *     so only threads that actually execute FP pay the ~132-byte context
+ *     cost. Leave it enabled; do not force it off.
  *   - No FP in ISRs (unsupported on ARMv7-M in Zephyr) -- both FP paths
  *     run in thread (workqueue) context, verified.
  *
@@ -47,6 +67,13 @@ LOG_MODULE_REGISTER(proximity);
 /* --- The registry: static array of phone_track records ---------------- */
 
 static struct phone_track phones[MAX_TRACKED_PHONES];
+
+/* Phase 3 ch3: verify the documented layout (offset table in proximity.h).
+ * If this fires after you edit the struct, update the table -- the docs
+ * and the code must not drift apart. BUILD_ASSERT is compile-time only,
+ * zero runtime cost (<zephyr/toolchain.h>, pulled in by kernel.h).
+ */
+BUILD_ASSERT(sizeof(struct phone_track) == 136);
 
 /* Indexed by enum phone_state. Must stay in sync with the enum. */
 const char *const phone_state_name[4] = {
@@ -145,8 +172,8 @@ static int find_free_slot(void)
  *     memset (will be set by caller)
  *   - kalman_x, kalman_p: 0.0 from memset -- kalman_update initializes
  *     them to (x0=z0, p0=r) on the first MATCH (match_count==0 sentinel)
- *   - rssi_buf: zeroed (ch3 will populate)
- *   - smoothed_buf: zeroed (ch3 will populate)
+ *   - trend ring / slope / valid / gated count: zeroed -- trend_push
+ *     inserts the first (x, t) point on that same first MATCH
  *
  * We memset the whole struct first (cheap, gets all padding too) then set
  * the fields we need. This is safer than partial init (no uninitialized
@@ -164,7 +191,8 @@ static int alloc_phone(const uint8_t *uuid)
     phones[slot].in_use = true;
     phones[slot].state  = PHONE_STATE_ABSENT;
     /* last_rssi, match_count, last_match_time, state_enter_time all 0 from
-     * memset. Kalman/ring/smoothed fields also 0 -- L2/L3 will initialize.
+     * memset. Kalman/trend fields also 0 -- kalman_update/trend_push
+     * initialize them on the first MATCH.
      */
 
     return slot;
@@ -353,6 +381,40 @@ static void kalman_update(int slot, int8_t z, int64_t now_ms)
     /* p_pred = p + q*dt   (uncertainty grows linearly with elapsed time)  */
     float p_pred = ph->kalman_p + PROX_KALMAN_Q_PER_SEC * dt_s;
 
+    /* --- 3-sigma innovation gate (Phase 3 ch3) -----------------------------
+     *
+     * The innovation (z - x) is the filter's own prediction residual; its
+     * variance is p_pred + r (estimate uncertainty + measurement noise).
+     * A residual beyond 3 sigma is either (a) a multipath outlier -- one
+     * channel's faded path, quantization stack-up, body micro-motion (the
+     * -76-among--65s spike in the L2 desk capture) -- or (b) a genuine
+     * fast level change.
+     *
+     * The gate cannot tell (a) from (b), and does not need to:
+     *   - (a) never persists: the next sample lands back inside the gate,
+     *     and the outlier never enters x or the trend ring. One-sample
+     *     spikes are exactly what LSQ slopes are most vulnerable to.
+     *   - (b) persists: each rejection leaves p = p_pred (time still
+     *     passed, no information gained), so the threshold WIDENS every
+     *     sample -- the gate self-opens within ~3 samples at 1 Hz.
+     *
+     * Squared comparison: |innov| >= k*sigma <=> innov^2 >= k^2*sigma^2.
+     * Comparing squares avoids sqrtf (libm dependency; see fmt_float2).
+     * PROX_KALMAN_GATE_SIGMA == 0.0f disables (constant-folded).
+     */
+    if (PROX_KALMAN_GATE_SIGMA > 0.0f) {
+        float innov = (float)z - ph->kalman_x;
+        float thresh2 = PROX_KALMAN_GATE_SIGMA * PROX_KALMAN_GATE_SIGMA
+                        * (p_pred + PROX_KALMAN_R);
+        if (innov * innov > thresh2) {
+            ph->kalman_p = p_pred;   /* time passed; no info gained */
+            ph->kalman_gated++;
+            LOG_DBG("kalman: slot=%d gate: z=%d rejected, too far from x "
+                    "(gated=%u)", slot, z, (unsigned)ph->kalman_gated);
+            return;                  /* x unchanged; caller still stamps time */
+        }
+    }
+
     /* --- Update: blend prediction with measurement ----------------------
      *
      * Optimal gain for combining two unbiased estimates (prediction with
@@ -380,6 +442,154 @@ static void kalman_update(int slot, int8_t z, int64_t now_ms)
     fmt_float2(ks, sizeof(ks), k);
     LOG_INF("kalman: slot=%d z=%d dt=%dms k=%s x=%s p=%s",
             slot, z, (int)(now_ms - ph->last_match_time), ks, xs, ps);
+}
+
+/* --- Trend: decimated (x,t) ring + LSQ slope (Phase 3 ch3) --------------- */
+
+/*
+ * trend_push: decimated insertion of the current Kalman output.
+ * (Phase 3 L3; design addendum 3-L1-A point (iii): one entry per
+ * >= TREND_DECIMATE_MS.)
+ *
+ * Called from proximity_on_match AFTER kalman_update (so we store the
+ * post-update estimate) and AFTER the field updates.
+ *
+ * Runs even when the innovation gate just rejected the sample: a gated
+ * sample still legitimately timestamps "our best estimate was x at time
+ * t" -- that IS the estimate trajectory, which is what the regression
+ * fits.
+ *
+ * Why decimation is safe: skipped samples are NOT lost -- the Kalman
+ * already fused them into kalman_x. The ring stores the trajectory of
+ * the ESTIMATE, not raw observations, so decimation loses no trend
+ * information while bounding ring churn and making the structure
+ * rate-independent (10 entries always span >= 5 s, at any MATCH rate).
+ */
+static void trend_push(int slot, int64_t now_ms)
+{
+    struct phone_track *ph = &phones[slot];
+    uint32_t now32 = (uint32_t)now_ms;
+
+    if (ph->trend_count > 0U) {
+        /* newest entry lives at (head - 1 + N) % N */
+        uint8_t last = (uint8_t)((ph->trend_head + TREND_RING_N - 1U)
+                                 % TREND_RING_N);
+        int32_t since = (int32_t)(now32 - ph->trend_t[last]);
+        if (since < TREND_DECIMATE_MS) {
+            return;  /* too soon; the Kalman already used this sample */
+        }
+    }
+
+    ph->trend_x[ph->trend_head] = ph->kalman_x;
+    ph->trend_t[ph->trend_head] = now32;
+    ph->trend_head = (uint8_t)((ph->trend_head + 1U) % TREND_RING_N);
+    if (ph->trend_count < TREND_RING_N) {
+        ph->trend_count++;
+    }
+
+    char xs[12];
+    fmt_float2(xs, sizeof(xs), ph->kalman_x);
+    LOG_DBG("trend: slot=%d push x=%s (n=%u)",
+            slot, xs, (unsigned)ph->trend_count);
+}
+
+/*
+ * trend_compute: refresh the LSQ slope over the 5 s time window.
+ * (Phase 3 L3; addendum 3-L1-A point (iii).)
+ *
+ * Runs in the 1 s tick, not per MATCH: the slope is a 5 s-window average
+ * that changes slowly, 1 s cadence is plenty, and L4's state machine
+ * will read the stored fields right here in the same tick.
+ *
+ * Method:
+ *   1. Walk the ring newest -> oldest (insertion order IS time order).
+ *   2. Keep entries with age <= TREND_WINDOW_MS. The window is anchored
+ *      at NOW, not at the newest entry -- so when the phone goes silent,
+ *      entries age out and the trend self-invalidates within ~5 s. That
+ *      is the desired honesty (no direction claim without fresh data),
+ *      not a bug. The walk breaks at the first too-old entry: everything
+ *      behind it is older still.
+ *   3. Guards: >= TREND_MIN_POINTS points AND >= TREND_MIN_SPAN_MS span,
+ *      else trend_valid=0 / slope=0.0f.
+ *   4. Mean-centered least squares. Time axis = age in seconds, NEGATIVE
+ *      and bounded [-5, 0]: no large numbers (absolute uptime in seconds
+ *      would waste float precision at ~0.008 s/ulp after one day), and
+ *      mean-centering before products avoids cancellation.
+ *
+ * Numerical safety: with the guards, the denominator sum (t - tbar)^2 is
+ * >= ~1 s^2 (4+ points, 2+ s span, >= 500 ms apart), so the division is
+ * well-conditioned; the explicit check below covers the impossible case.
+ *
+ * Stack: ts[10] + xs[10] = 80 bytes, reused per phone. sysworkq had
+ * ~1300 bytes free at last check.
+ */
+static void trend_compute(int slot, int64_t now_ms)
+{
+    struct phone_track *ph = &phones[slot];
+    uint32_t now32 = (uint32_t)now_ms;
+
+    float ts[TREND_RING_N];   /* time axis: age in s (negative = past) */
+    float xs[TREND_RING_N];
+    uint8_t n = 0;
+    int32_t age_first = 0;    /* age of newest kept entry, ms */
+    int32_t age_last = 0;     /* age of oldest kept entry, ms */
+
+    for (uint8_t i = 0; i < ph->trend_count; i++) {
+        uint8_t idx = (uint8_t)((ph->trend_head + TREND_RING_N - 1U - i)
+                                % TREND_RING_N);
+        int32_t age = (int32_t)(now32 - ph->trend_t[idx]);
+        if (age > TREND_WINDOW_MS) {
+            break;   /* ring is time-ordered: all older entries are out */
+        }
+        if (n == 0U) {
+            age_first = age;
+        }
+        age_last = age;
+        ts[n] = -(float)age / 1000.0f;
+        xs[n] = ph->trend_x[idx];
+        n++;
+    }
+
+    int32_t span_ms = age_last - age_first;
+
+    if ((n < TREND_MIN_POINTS) || (span_ms < TREND_MIN_SPAN_MS)) {
+        ph->trend_valid = 0;
+        ph->trend_slope = 0.0f;
+        LOG_DBG("trend: slot=%d INVALID (n=%u span=%dms)",
+                slot, (unsigned)n, (int)span_ms);
+        return;
+    }
+
+    /* Mean-centered LSQ: slope = sum((t-tbar)*(x-xbar)) / sum((t-tbar)^2) */
+    float mt = 0.0f, mx = 0.0f;
+    for (uint8_t i = 0; i < n; i++) {
+        mt += ts[i];
+        mx += xs[i];
+    }
+    mt /= (float)n;
+    mx /= (float)n;
+
+    float s_tt = 0.0f, s_tx = 0.0f;
+    for (uint8_t i = 0; i < n; i++) {
+        float dtt = ts[i] - mt;
+        float dxx = xs[i] - mx;
+        s_tt += dtt * dtt;
+        s_tx += dtt * dxx;
+    }
+
+    if (s_tt < 0.0001f) {  /* impossible with the guards; cheap insurance */
+        ph->trend_valid = 0;
+        ph->trend_slope = 0.0f;
+        return;
+    }
+
+    ph->trend_slope = s_tx / s_tt;   /* dB/s; + = approaching, - = receding */
+    ph->trend_valid = 1;
+
+    char sb[12];
+    fmt_float2(sb, sizeof(sb), ph->trend_slope);
+    LOG_DBG("trend: slot=%d slope=%s dB/s (n=%u span=%dms)",
+            slot, sb, (unsigned)n, (int)span_ms);
 }
 
 /* --- Periodic tick ---------------------------------------------------- */
@@ -434,6 +644,12 @@ static void proximity_tick_handler(struct k_work *work)
 
         /* L4 will add: dwell timer checks for APPROACHING->PRESENT etc. */
 
+        /* Phase 3 ch3: refresh the trend slope (LSQ over the 5 s window).
+         * 1 s cadence is plenty -- the slope is a 5 s-window average that
+         * changes slowly, and L4 will read the stored fields right here.
+         */
+        trend_compute(i, now);
+
         /* DBG: per-tick per-phone snapshot for dev observability.
          * Visible only when CONFIG_LOG_DEFAULT_LEVEL=4 (DBG).
          * Off in production (CONFIG_LOG_DEFAULT_LEVEL=3 = INF).
@@ -449,14 +665,20 @@ static void proximity_tick_handler(struct k_work *work)
         /* Phase 3 ch2: Kalman estimate + variance in the per-tick snapshot.
          * fmt_float2 avoids CONFIG_CBPRINTF_FP_SUPPORT.
          */
-        char xs[12], ps[12];
+        char xs[12], ps[12], sl[12];
         fmt_float2(xs, sizeof(xs), phones[i].kalman_x);
         fmt_float2(ps, sizeof(ps), phones[i].kalman_p);
+        if (phones[i].trend_valid) {
+            fmt_float2(sl, sizeof(sl), phones[i].trend_slope);
+        } else {
+            (void)snprintk(sl, sizeof(sl), "INVALID");
+        }
 
-        LOG_INF("tick: slot=%d state=%s rssi=%d kalman_x=%s p=%s "
-                "matches=%u age=%lldms in_state=%lldms",
+        LOG_DBG("tick: slot=%d state=%s rssi=%d x=%s p=%s slope=%s "
+                "matches=%u gated=%u age=%lldms in_state=%lldms",
                 i, phone_state_name[phones[i].state],
-                phones[i].last_rssi, xs, ps, phones[i].match_count,
+                phones[i].last_rssi, xs, ps, sl, phones[i].match_count,
+                (unsigned)phones[i].kalman_gated,
                 (long long)since_match, (long long)time_in_state);
     }
 
@@ -530,7 +752,14 @@ int proximity_on_match(const uint8_t *uuid, int8_t rssi)
     phones[slot].last_match_time = now;
     phones[slot].match_count++;
 
-    /* 4. State machine: ABSENT -> APPROACHING on first MATCH
+    /* 4. Trend decimation (Phase 3 ch3): store the post-update estimate
+     * into the (x, t) ring. Runs AFTER kalman_update so we push the
+     * freshly-blended x; runs regardless of whether this sample was
+     * gated (a gated sample still timestamps the estimate trajectory).
+     */
+    trend_push(slot, now);
+
+    /* 5. State machine: ABSENT -> APPROACHING on first MATCH
      *
      * For a newly-allocated slot, state is ABSENT (set in alloc_phone).
      * For an existing slot that timed out and was freed, alloc_phone also
