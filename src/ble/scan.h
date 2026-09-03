@@ -39,7 +39,7 @@
  */
 
 #define SCAN_INTERVAL          400   /* 250 ms */
-#define SCAN_WINDOW            160    /* 100 ms */
+#define SCAN_WINDOW            SCAN_INTERVAL //160    /* 100 ms */
 #define SCAN_MSGQ_DEPTH        32    /* advs queued before workqueue drains */
 #define SCAN_STATS_PERIOD_SEC   10   /* periodic stats dump interval */
 #define BT_ADV_PAYLOAD_MAX     31U   /* legacy ADV_IND / NONCONN / SCAN_IND */

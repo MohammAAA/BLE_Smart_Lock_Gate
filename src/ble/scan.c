@@ -35,7 +35,29 @@
 #include <zephyr/net_buf.h>               /* struct net_buf_simple, net_buf_simple_init_with_data       */
 #include <zephyr/sys/printk.h>            /* snprintk */
 
-LOG_MODULE_REGISTER(ble_scan);
+/*
+ * Pin the ble_scan module to the log level (INF) (Phase 3 ch3 lab fix, 3-L3-B).
+ *
+ * Why: scan_work_handler emits one DBG line per NON-MATCHING adv
+ * ("non-match: addr=...") -- in a residential environment that is maybe tens
+ * of lines per second. The ch3 lab sets
+ * CONFIG_LOG_DEFAULT_LEVEL=4 to expose proximity's DBG tuning lines,
+ * which used to arm this firehose too: the deferred-mode log pool
+ * (CONFIG_LOG_BUFFER_SIZE) filled, messages were DROPPED, and the
+ * kalman:/trend:/tick: lines we actually wanted drowned in noise.
+ *
+ * Registering with an explicit level makes this module IGNORE
+ * CONFIG_LOG_DEFAULT_LEVEL: with max level INF, the LOG_DBG sites in
+ * this file compile to nothing -- zero code, zero RAM, cannot flood.
+ * (Same intent as CONFIG_BT_LOG_LEVEL_INF / CONFIG_USBD_LOG_LEVEL_WRN
+ * already in prj.conf; for an app module the pin lives here because it
+ * has no Kconfig plumbing.)
+ *
+ * To debug adv parsing again (Phase 2 style): temporarily change to
+ * LOG_LEVEL_DBG, rebuild, revert.
+ 
+ */
+LOG_MODULE_REGISTER(ble_scan, LOG_LEVEL_INF);
 
 /* --- Stats (single producer in BT RX thread, single consumer (reader) in stats work) */
 static struct scan_stats stats;
