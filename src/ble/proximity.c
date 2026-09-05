@@ -72,8 +72,23 @@
 #include <zephyr/sys/printk.h>   /* snprintk */
 #include <string.h>             /* memset, memcmp, memcpy */
 
-LOG_MODULE_REGISTER(proximity);
-
+/*
+ * Pin this module to DBG (Phase 3 L3-E: "quiet world, loud pins").
+ *
+ * This is the TELEMETRY module: kalman:/trend:/tick:/gate: lines are the
+ * tuning view we want in every Phase 3 lab, permanently. Volume is
+ * bounded by design -- ~1 line/s per active phone per stream (tick,
+ * slope, push, kalman = ~4-5 lines/s total at 1 Hz adv + 100% duty),
+ * far under what the CDC ACM console drains. Contrast scan.c: pinned
+ * to INF because its only DBG site fires for EVERY non-matching adv
+ * in the air (the L3-B firehose).
+ *
+ * Requires CONFIG_LOG_MAX_LEVEL=4 in prj.conf: a module's effective
+ * compiled level is min(pin, MAX), and MAX defaults to DEFAULT_LEVEL.
+ * With DEFAULT=3 and no explicit MAX, this DBG pin would be silently
+ * clamped to INF and the data lines would never appear.
+ */
+LOG_MODULE_REGISTER(proximity, LOG_LEVEL_DBG);
 /* --- The registry: static array of phone_track records ---------------- */
 
 static struct phone_track phones[MAX_TRACKED_PHONES];
@@ -727,7 +742,7 @@ static void proximity_tick_handler(struct k_work *work)
         }
 
         LOG_DBG("tick: slot=%d state=%s rssi=%d x=%s p=%s slope=%s "
-                "matches=%u gated=%u age=%lldms in_state=%lldms",
+                "matches=%u gated=%u age since last match=%lldms in_state=%lldms",
                 i, phone_state_name[phones[i].state],
                 phones[i].last_rssi, xs, ps, sl, phones[i].match_count,
                 (unsigned)phones[i].kalman_gated,
