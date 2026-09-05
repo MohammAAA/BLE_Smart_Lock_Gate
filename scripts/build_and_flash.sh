@@ -7,12 +7,13 @@
 #   4- flash the firmware
 #   5- If user wants to trigger monitor, start cat command. Can optionally save and clean logs.
 
-# Exit immediately if a command exits with a non-zero status.
-# This ensures that if a step like 'west build' fails, it won't proceed to flash.
 # Example 1: ./scripts/build_and_flash.sh --source-zephyr # Just build and flash
 # Example 2: ./scripts/build_and_flash.sh --monitor # Monitors using cat without saving logs
 # Example 3: ./scripts/build_and_flash.sh --save-log # Monitors using cat and saving the log file to the default path and with default name
 # Example 4: ./scripts/build_and_flash.sh --save-log --custom-path ./my_logs/custom_reading.log # Monitors using cat and saving the log file to a custom path
+
+# Exit immediately if a command exits with a non-zero status.
+# This ensures that if a step like 'west build' fails, it won't proceed to flash.
 set -e
 
 # Variables to track monitor and logging
@@ -36,8 +37,15 @@ do
         shift
         ;;
         --custom-path)
-        CUSTOM_PATH="$2"
-        shift 2
+        # If the next argument is not another flag, then it is a valid path
+        if [ -n "$2" ] && [[ "$2" != -* ]]; then
+            CUSTOM_PATH="$2"
+            shift 2
+        else
+            # The next argument doesn't include a valid path, exit with error
+            echo "LOG Error: --custom-path requires a valid file path argument."
+            exit 1
+        fi
         ;;
         -s|--source-zephyr)
         SOURCE_ZEPHYR=1
