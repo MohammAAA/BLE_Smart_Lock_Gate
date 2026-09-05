@@ -5,28 +5,45 @@
 #   2- build the software for promicro_nrf52840 using --pristine to clear cached data
 #   3- convert the output hex file to uf2 file
 #   4- flash the firmware
-#   5- If user wants to trigger screen command, do trigger it.
+#   5- If user wants to trigger monitor, start cat command. Can optionally save and clean logs.
 
 # Exit immediately if a command exits with a non-zero status.
 # This ensures that if a step like 'west build' fails, it won't proceed to flash.
+# Example 1: ./scripts/build_and_flash.sh --source-zephyr # Just build and flash
+# Example 2: ./scripts/build_and_flash.sh --monitor # Monitors using cat without saving logs
+# Example 3: ./scripts/build_and_flash.sh --save-log # Monitors using cat and saving the log file to the default path and with default name
+# Example 4: ./scripts/build_and_flash.sh --save-log --custom-path ./my_logs/custom_reading.log # Monitors using cat and saving the log file to a custom path
 set -e
 
-# Variable to track whether the user want to start screen session or not.
-START_SCREEN=0
+# Variables to track monitor and logging
+START_MONITOR=0
+SAVE_LOG=0
+CUSTOM_PATH=""
 # whether to source zephyr environment or not.
 SOURCE_ZEPHYR=0
 
 # Parse arguments
-# "$@" is a special Bash variable that holds all the command-line arguments passed to the script
-for arg in "$@"
+while [[ $# -gt 0 ]]
 do
-    case $arg in
-        --screen)
-        START_SCREEN=1
+    case $1 in
+        --monitor)
+        START_MONITOR=1
         shift # This shifts all command-line arguments one position to the left (e.g., what was argument 2 becomes argument 1). It's commonly used to "consume" arguments once they've been processed.
         ;; # equavilent to 'break' in C
+        --save-log)
+        START_MONITOR=1
+        SAVE_LOG=1
+        shift
+        ;;
+        --custom-path)
+        CUSTOM_PATH="$2"
+        shift 2
+        ;;
         -s|--source-zephyr)
         SOURCE_ZEPHYR=1
+        shift
+        ;;
+        *)
         shift
         ;;
     esac
@@ -79,12 +96,55 @@ echo "LOG: 4. Flashing firmware..."
 
 echo "LOG: Flashing successful!"
 
-if [ $START_SCREEN -eq 1 ]; then
-    echo "Waiting for 5 seconds before starting screen monitor .. "
+if [ $START_MONITOR -eq 1 ]; then
+    echo "Waiting for 5 seconds before starting monitor .. "
     sleep 5
-    echo "LOG: 5. Starting screen monitor on /dev/ttyACM0 at 115200 baud..."
-    # Screen will take over the terminal until you detach or exit.
-    screen /dev/ttyACM0 115200
+    echo "LOG: 5. Starting monitor on /dev/ttyACM0..."
+    stty -F /dev/ttyACM0 raw -echo
+    if [ $SAVE_LOG -eq 1 ]; then
+        if [ -z "$CUSTOM_PATH" ]; then
+            mkdir -p ./logs
+            TIMESTAMP=$(date +"%Y%m%d%H%M%S")
+            LOG_FILE="./logs/${TIMESTAMP}.log"
+        else
+            LOG_DIR=$(dirname "$CUSTOM_PATH")
+            mkdir -p "$LOG_DIR"
+            LOG_FILE="$CUSTOM_PATH"
+        fi
+        echo "LOG: Saving log to $LOG_FILE"
+        
+        # This defines a custom Bash function named "cleanup".
+        # In Bash, we can group multiple commands together inside a function block.
+        # We put the sed log-cleaning commands and the
+        # final print statements inside this function so that they can be easily
+        # triggered as a single action later.
+        cleanup() {
+            echo ""
+            echo "LOG: Cleaning log file..."
+            CLEAN_LOG_FILE="${LOG_FILE%.log}_clean.log"
+            sed 's/\r$//' "$LOG_FILE" | sed 's/\x1b\[[0-9;?]*[a-zA-Z]//g' > "$CLEAN_LOG_FILE"
+            echo "LOG: Clean log saved to $CLEAN_LOG_FILE"
+            # Tell the script to stop executing and terminate immediately.
+            exit 0
+        }
+        
+        # 'trap' is a command that listens for specific system signals.
+        # 'INT' stands for SIGINT (Signal Interrupt. i.e.: Ctrl+C)
+        # We want to say: When the user presses Ctrl+C, do not
+        # immediately kill the script. Instead, execute the cleanup function first.
+        trap cleanup INT
+        
+        cat /dev/ttyACM0 | tee -a "$LOG_FILE"
+    else
+        # when the user just uses --monitor without --save-log, run the following trap.
+        # 1. echo "" (prints a blank line so the terminal prompt doesn't look messy after we hit Ctrl+C).
+        # 2. Prints "LOG: Exiting monitor..."
+        # 3. exit 0 (exits the script cleanly).
+        # Without this trap, hitting Ctrl+C to exit the cat monitor would just
+        # kill the script abruptly without giving any feedback to the user.
+        trap 'echo ""; echo "LOG: Exiting monitor..."; exit 0' INT
+        cat /dev/ttyACM0
+    fi
 else
-    echo "LOG: Done. Use --screen flag to automatically start the screen monitor."
+    echo "LOG: Done. Use --monitor or --save-log flag next time to automatically start the monitor."
 fi
