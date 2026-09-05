@@ -29,7 +29,16 @@
  *       from the original plan: DROPPED (the LSQ is itself a smoother;
  *       a series MA would add ~5.5 s slope-onset lag -- analysis and
  *       falsification criterion in the L3 lesson).
- *   - ch4 (pending): RSSI threshold + dwell timers driving
+ *       CH3 LAB (3-L3-C): After testing, the gate FREEZES on sustained genuine ramps
+ *       (walk-in/-out) -- rejection freezes x, innovation grows while
+ *       the threshold grows only as sqrt(q*t), and the filter goes
+ *       blind for 9-12+ s until motion stops. Fix: restore Q=2.0 (we ran Q=1.0, which armed the freeze) + consecutive-
+ *       rejection circuit breaker (PROX_KALMAN_GATE_MAX_REJECTS).
+ *       Validated in the same lab: R=4.0 is exact in the new open
+ *       environment at 1 m (measured sigma_z=2.01 -> R_emp=4.04);
+ *       stationary sigma_b=0.28 dB/s -> trust floor 0.8 dB/s; the
+ *       deep-fade gate rejections in run5 worked exactly as designed.
+ *   - L4 (pending): RSSI threshold + dwell timers driving
  *         APPROACHING->PRESENT, PRESENT->DEPARTING, DEPARTING->ABSENT
  *   - ch5 (pending): asymmetric scan (modifies scan_start to accept
  *         per-state params; scan duty is a latency/energy/spectrum knob
@@ -162,6 +171,15 @@
  *   - so true RSSI drifts ~1-2.5 dB/s -> variance ~1-6 dB^2/s
  *   - Q_PER_SEC = 2.0 (sigma ~1.4 dB/s) sits mid-band for a calm walk
  *
+ * LAB NOTE (3-L3-C): the value matters beyond tuning -- it is also the
+ * gate-opening rate. Each gate rejection leaves p = p_pred = p + q*dt,
+ * so the 3-sigma threshold widens ~sqrt(q*t) while a rejected genuine
+ * WALK keeps growing its innovation ~s*t. Q too low -> the gate wins
+ * the race too often and the filter freezes on ramps (initially, we
+ * ran 1.0f and froze for 12+ s on a 7-8 m walk-in test; the Q=2.0
+ * replay of the same data tracks the whole walk with zero rejections).
+ * Recommendation: Do not tune below 1.5 without re-running the walk lab.
+ *
  * Tune UP (4-8): DBG logs show kalman_x lagging a walking person by >3 dB.
  * Tune DOWN (0.5-1): DBG logs show kalman_x jumping on every multipath
  * outlier while the phone is stationary.
@@ -171,7 +189,7 @@
  *   K_ss = (p_ss + q_step) / (p_ss + q_step + r)
  * Derivation + operating-point table in the ch2 lesson.
  */
-#define PROX_KALMAN_Q_PER_SEC 1.0f
+#define PROX_KALMAN_Q_PER_SEC 2.0f
 
 /*
  * Measurement noise: variance of ONE RSSI reading, dB^2. r = 4.0 means
@@ -264,6 +282,43 @@
  * changes). Full trace in the L3 lesson Q3.
  */
 #define PROX_KALMAN_GATE_SIGMA 3.0f
+
+/*
+ * PROX_KALMAN_GATE_MAX_REJECTS: consecutive-rejection circuit breaker.
+ * (Phase 3 ch3 lab fix, 3-L3-C.)
+ *
+ * THE FAILURE THIS CAPS: on a sustained genuine RAMP (a person walking
+ * in or out), the first fast samples get rejected; x freezes; the
+ * innovation then measures the FULL accumulated drift and grows at the
+ * walk rate while the gate threshold grows only ~sqrt(q*t). The gate
+ * can stay shut for 9-12+ s (observed in our walk-in test capture:
+ * x frozen at -70.9 while the phone walked to -53; it only reopened
+ * after motion STOPPED). The L3 lesson's claim "the gate never bites
+ * on physical walking" was wrong -- it bit on exactly that.
+ *
+ * THE INVARIANT: the gate may reject outliers for at most N-1
+ * consecutive samples; on the Nth consecutive rejection the sample is
+ * force-ACCEPTED through the normal update (no re-init hack). This is
+ * honest Bayesian mechanics, not a workaround: N consecutive
+ * rejections have already inflated p to ~p0+N*q*dt, so the forced
+ * update runs with k ~ 0.7-0.9 -- it mostly trusts the measurement,
+ * exactly as it should after ~N seconds of acknowledged blindness.
+ * Worst-case estimate staleness: N samples (4 s at 1 Hz, 0.4 s at
+ * 10 Hz) -- bounded forever, at any Q, at any walk speed.
+ *
+ * Why 4: survives the observed 2-3-sample multipath fade BURSTS
+ * (Phase 2 L2-A desk capture; the test run5's fades never exceeded 3 in a row)
+ * while capping freeze latency at ~4 s. If a lab ever shows 4+
+ * consecutive bad samples, the estimate snaps toward them for one
+ * sample and recovers on the next -- asymmetric risk: persistent fades
+ * pull x DOWN (delayed unlock, safe direction); persistent positive
+ * innovations are approaching phones (correct direction). There is no
+ * physical mechanism that holds RSSI 10+ dB ABOVE the path-loss truth
+ * for 4+ consecutive seconds.
+ *
+ * Set to 0 to disable (gate alone, pre-lab behavior).
+ */
+#define PROX_KALMAN_GATE_MAX_REJECTS 4
 
 /* --- State machine ---------------------------------------------------- */
 
@@ -383,7 +438,8 @@ struct phone_track {
      *   28  trend_x[10]       float    (40)
      *   68  trend_t[10]       uint32_t (40)
      *   108 trend_slope       float    (4)
-     *   112 kalman_gated      uint16_t (2)
+     *   112 kalman_gated      uint8_t  (1)
+     *   113 kalman_reject_str  uint8_t  (1)
      *   114 uuid[16]          uint8_t  (16)
      *   130 in_use            bool     (1)
      *   131 state             uint8_t  (1)
@@ -417,7 +473,17 @@ struct phone_track {
      * trend_valid == 0 means "no direction claim", NOT "stationary".
      */
     float    trend_slope;
-    uint16_t kalman_gated;         /* MATCHes rejected by the 3-sigma gate */
+    /* MATCHes rejected by the 3-sigma gate since alloc. Saturating at
+     * 255 (was uint16_t; the shrink pays for the streak counter below
+     * without changing sizeof -- 8 slots x 2 bytes saved). A diagnostic
+     * total, not logic: saturation just parks it at 255.
+     */
+    uint8_t  kalman_gated;
+    /* Consecutive gate rejections, reset on every acceptance. Drives
+     * the circuit breaker (PROX_KALMAN_GATE_MAX_REJECTS): the gate may
+     * never freeze the filter for more than N-1 consecutive samples.
+     */
+    uint8_t  kalman_reject_streak;
 
     /* --- Identity + small fields --- */
     uint8_t  uuid[MSD_LEN_UUID];   /* 16 bytes, network order (RFC 4122) */

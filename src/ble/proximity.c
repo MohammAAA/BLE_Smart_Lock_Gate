@@ -39,6 +39,16 @@
  *      verifies the documented layout
  *   5. tick DBG now includes slope (or INVALID) + gated count
  *
+ * Phase 3 ch3 lab changes (3-L3-C, after the walk-lab analysis):
+ *   6. Circuit breaker in kalman_update: after N consecutive gate
+ *      rejections the sample is force-accepted through the normal
+ *      update (bounded staleness invariant -- see
+ *      PROX_KALMAN_GATE_MAX_REJECTS in proximity.h). Driven by the
+ *      new kalman_reject_streak field.
+ *   7. kalman_gated uint16_t -> uint8_t, saturating at 255 (pays for
+ *      the streak byte; sizeof(phone_track) stays 136).
+ *
+ *
  * Float discipline (Cortex-M4F, single-precision FPv4 FPU):
  *   - float only, never double; ALL float constants f-suffixed
  *   - CONFIG_FPU=y in prj.conf (hard-float ABI for the whole build)
@@ -347,10 +357,11 @@ static void kalman_update(int slot, int8_t z, int64_t now_ms)
      * wait on the critical path.
      *
      * match_count == 0 is a reliable "not yet initialized" sentinel:
-     * alloc_phone memsets the slot, and alloc + first feed happen inside
-     * the same proximity_on_match call, so this branch fires exactly once
-     * per slot lifetime (match_count is only 0 between memset and the
-     * first increment, which brackets this call).
+     * alloc_phone memsets the slot (kalman_reject_streak = 0 too), and
+     * alloc + first feed happen inside the same proximity_on_match call,
+     * so this branch fires exactly once per slot lifetime (match_count
+     * is only 0 between memset and the first increment, which brackets
+     * this call).
      */
     if (ph->match_count == 0U) {
         ph->kalman_x = (float)z;
@@ -381,37 +392,67 @@ static void kalman_update(int slot, int8_t z, int64_t now_ms)
     /* p_pred = p + q*dt   (uncertainty grows linearly with elapsed time)  */
     float p_pred = ph->kalman_p + PROX_KALMAN_Q_PER_SEC * dt_s;
 
-    /* --- 3-sigma innovation gate (Phase 3 ch3) -----------------------------
+    /* --- 3-sigma innovation gate (Phase 3 ch3) + circuit breaker -------------
      *
      * The innovation (z - x) is the filter's own prediction residual; its
      * variance is p_pred + r (estimate uncertainty + measurement noise).
      * A residual beyond 3 sigma is either (a) a multipath outlier -- one
      * channel's faded path, quantization stack-up, body micro-motion (the
-     * -76-among--65s spike in the L2 desk capture) -- or (b) a genuine
-     * fast level change.
+     * -76-among--65s spike in the ch2 desk capture; the -87..-76 deep
+     * fades of the ch3 gate-hunt run) -- or (b) a genuine fast level
+     * change.
      *
-     * The gate cannot tell (a) from (b), and does not need to:
-     *   - (a) never persists: the next sample lands back inside the gate,
-     *     and the outlier never enters x or the trend ring. One-sample
-     *     spikes are exactly what LSQ slopes are most vulnerable to.
-     *   - (b) persists: each rejection leaves p = p_pred (time still
-     *     passed, no information gained), so the threshold WIDENS every
-     *     sample -- the gate self-opens within ~3 samples at 1 Hz.
+     * For (a) the gate is exactly right: fades never persist more than
+     * 2-3 samples (validated: run5's 6 rejections, x std 1.46 dB vs
+     * z std 6.79 dB -- the estimate stayed clean through swings).
+     *
+     * For (b) the L3 lab falsified the original claim that the gate
+     * "self-opens within ~3 samples": that is true for a persistent
+     * LEVEL STEP, but on a sustained RAMP (walking) the innovation KEEPS
+     * GROWING while the threshold grows only ~sqrt(q*t) -- the gate can
+     * stay shut for 9-12+ s and the estimate goes blind (observed:
+     * walk-in frozen at -70.9 while the phone reached -53).
+     *
+     * The circuit breaker (PROX_KALMAN_GATE_MAX_REJECTS) restores the
+     * missing invariant: after N consecutive rejections the sample is
+     * force-accepted through the NORMAL update below. No special-case
+     * math: N rejections have already inflated p, so k is naturally
+     * ~0.7-0.9 and the filter mostly trusts the measurement -- which is
+     * the correct Bayesian attitude after N samples of acknowledged
+     * blindness. The gate can therefore never freeze the filter for
+     * longer than N-1 consecutive samples, at any Q, at any walk speed.
      *
      * Squared comparison: |innov| >= k*sigma <=> innov^2 >= k^2*sigma^2.
      * Comparing squares avoids sqrtf (libm dependency; see fmt_float2).
      * PROX_KALMAN_GATE_SIGMA == 0.0f disables (constant-folded).
      */
+    bool force_accept = false;
+
     if (PROX_KALMAN_GATE_SIGMA > 0.0f) {
         float innov = (float)z - ph->kalman_x;
         float thresh2 = PROX_KALMAN_GATE_SIGMA * PROX_KALMAN_GATE_SIGMA
                         * (p_pred + PROX_KALMAN_R);
         if (innov * innov > thresh2) {
-            ph->kalman_p = p_pred;   /* time passed; no info gained */
-            ph->kalman_gated++;
-            LOG_DBG("kalman: slot=%d gate: z=%d rejected, too far from x "
-                    "(gated=%u)", slot, z, (unsigned)ph->kalman_gated);
-            return;                  /* x unchanged; caller still stamps time */
+            if (PROX_KALMAN_GATE_MAX_REJECTS > 0U &&
+                ph->kalman_reject_streak + 1U >=
+                PROX_KALMAN_GATE_MAX_REJECTS) {
+                /* Nth consecutive rejection: break the freeze. p is
+                 * already inflated (p_pred); fall through to the normal
+                 * update with the wide gain. Streak resets below.
+                 */
+                force_accept = true;
+            } else {
+                ph->kalman_reject_streak++;
+                ph->kalman_p = p_pred;   /* time passed; no info gained */
+                if (ph->kalman_gated < 255U) {
+                    ph->kalman_gated++;  /* saturating diagnostic total */
+                }
+                LOG_DBG("kalman: slot=%d gate: z=%d rejected, too far from x "
+                        "(streak=%u gated=%u)", slot, z,
+                        (unsigned)ph->kalman_reject_streak,
+                        (unsigned)ph->kalman_gated);
+                return;                  /* x unchanged; caller stamps time */
+            }
         }
     }
 
@@ -431,6 +472,17 @@ static void kalman_update(int slot, int8_t z, int64_t now_ms)
     ph->kalman_x += k * ((float)z - ph->kalman_x);
     ph->kalman_p  = (1.0f - k) * p_pred;
 
+    /* Every acceptance (normal or breaker) resets the streak: a single
+     * good sample proves the estimate is live again. (Phase 3 L3-C.)
+     */
+    ph->kalman_reject_streak = 0U;
+
+    if (force_accept) {
+        LOG_DBG("kalman: slot=%d gate breaker: forced accept z=%d "
+                "after %u consecutive rejections", slot, z,
+                (unsigned)(PROX_KALMAN_GATE_MAX_REJECTS - 1U));
+    }
+
     /*
      * Per-MATCH tuning view (DBG only): the five numbers you stare at
      * while tuning q/r. Enable with CONFIG_LOG_DEFAULT_LEVEL=4.
@@ -440,7 +492,7 @@ static void kalman_update(int slot, int8_t z, int64_t now_ms)
     fmt_float2(xs, sizeof(xs), ph->kalman_x);
     fmt_float2(ps, sizeof(ps), ph->kalman_p);
     fmt_float2(ks, sizeof(ks), k);
-    LOG_INF("kalman: slot=%d z=%d dt=%dms k=%s x=%s p=%s",
+    LOG_DBG("kalman: slot=%d z=%d dt=%dms k=%s x=%s p=%s",
             slot, z, (int)(now_ms - ph->last_match_time), ks, xs, ps);
 }
 
@@ -697,6 +749,15 @@ int proximity_init(void)
 
     /* Schedule first tick. k_work_reschedule is idempotent: if already
      * scheduled, it reschedules to the new time. Safe to call multiple times.
+     *
+     * Return contract (Zephyr Quirk #11, learned from the student's boot
+     * log): the delayable-work scheduling functions return 0 or 1 on
+     * SUCCESS (0 = newly scheduled; positive = scheduling-state info,
+     * e.g. already scheduled / deadline updated) and NEGATIVE errno on
+     * failure. The old `rc != 0` check raised a false ERR on first boot
+     * with rc=1 while the schedule actually SUCCEEDED (the registry and
+     * transitions demonstrably worked). Only rc < 0 is an error.
+     *
      */
     int rc = k_work_reschedule(&proximity_tick_work, K_MSEC(PROX_TICK_MS));
     if (rc < 0) {
