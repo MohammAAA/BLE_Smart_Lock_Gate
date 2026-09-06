@@ -11,8 +11,9 @@
  *   - State machine enum: ABSENT -> APPROACHING -> PRESENT -> DEPARTING -> ABSENT
  *   - Real transitions in ch1: ABSENT->APPROACHING (on first MATCH), Any->ABSENT
  *     (30s timeout)
- *   - Stub transitions (ch4 will fill): APPROACHING->PRESENT (dwell+RSSI),
- *     PRESENT->DEPARTING, DEPARTING->ABSENT
+ *   - Stub transitions in ch1 (now filled by the ch4 evaluator in the tick):
+ *     APPROACHING->PRESENT (dwell+RSSI), PRESENT->DEPARTING,
+ *     DEPARTING->ABSENT (implemented as slot-freedom)
  *   - 1-second proximity_tick via k_work_delayable (state evolution + cleanup)
  *   - All state transitions logged at INF for audit
  *
@@ -38,8 +39,11 @@
  *       environment at 1 m (measured sigma_z=2.01 -> R_emp=4.04);
  *       stationary sigma_b=0.28 dB/s -> trust floor 0.8 dB/s; the
  *       deep-fade gate rejections in run5 worked exactly as designed.
- *   - L4 (pending): RSSI threshold + dwell timers driving
- *         APPROACHING->PRESENT, PRESENT->DEPARTING, DEPARTING->ABSENT
+ *   ch4 (delivered): the evaluator -- RSSI thresholds on kalman_x +
+ *         dwell credit + trend modulation (decision table below, with
+ *         the Phase 3 L4 tunables) + UNLOCK/RELOCK events via
+ *         registered callback + DEPARTING exits (silence / floor) +
+ *         first-sight -90 floor in proximity_on_match.
  *   - ch5 (pending): asymmetric scan (modifies scan_start to accept
  *         per-state params; scan duty is a latency/energy/spectrum knob
  *         only -- never a correctness knob, addendum 3-L1-A (vi))
@@ -74,8 +78,9 @@
  * 8 slots covers the worst case (party, all residents near one gate) with
  * headroom.
  *
- * RAM cost: 8 * sizeof(struct phone_track) = 8 * ~112 bytes (incl. padding)
- *         = ~896 bytes. Trivial vs nRF52840's 256 KB RAM.
+ * RAM cost: 8 * sizeof(struct phone_track) = 8 * 144 bytes = 1152
+ *         bytes (Phase 3 ch4 layout, see the offset table at the struct).
+ *         Trivial vs nRF52840's 256 KB RAM.
  *
  * What happens if a 9th phone appears while all 8 slots are full?
  *   - The 9th phone's MATCH is logged at WRN ("registry full, ignoring uuid=...")
@@ -137,7 +142,9 @@
  *   - Checks 30s timeout (frees gone phones)
  *   - Logs state + time-in-state at DBG level (so we can see the state
  *     machine working when DBG is enabled)
- *   - In L4: will also check dwell timers for state transitions
+ *   - ch4 delivered: refreshes the trend (trend_compute) then runs the
+ *     evaluator (evaluate_phone) per phone -- thresholds, dwell
+ *     credit, trend modulation, transitions, UNLOCK/RELOCK events
  *
  * Why 1 second:
  *   - Fine enough to catch 30s timeout within 1s of expiry (good enough for
@@ -320,6 +327,214 @@
  */
 #define PROX_KALMAN_GATE_MAX_REJECTS 4
 
+/* --- Evaluator tunables (Phase 3 ch4) ------------------------------------ */
+
+/*
+ * THE EVALUATOR DECISION TABLE. Everything below is consumed in the
+ * 1 s tick, in evaluate_phone(), immediately after trend_compute() for
+ * the same phone (rule R5: level and trend are read in the same tick
+ * that computed them -- one consistent snapshot, serialized on the
+ * system workqueue).
+ *
+ *   state          condition         trend >= +floor    trend <= -floor
+ *   -------------  ----------------  -----------------  -----------------
+ *   APPROACHING /  kalman_x >        NEUTRAL: nominal   credit PAUSED
+ *   DEPARTING      PROX_UNLOCK_RSSI  target 3 s         (pass-through
+ *   (return user)  -> PRESENT +      (no confirm on      protection)
+ *                  UNLOCK event      the unlock path --
+ *                                   see the confirmed-
+ *                                   dwell comment)
+ *
+ *   PRESENT        kalman_x <        target 3 s         credit PAUSED
+ *                  PROX_RELOCK_RSSI  (confirmed)        (returner
+ *                  -> DEPARTING +                       protection)
+ *                  RELOCK event
+ *
+ * And when the trend is INVALID or |slope| < floor: NEUTRAL -- the
+ * nominal targets (3 s unlock / 5 s relock) run unchanged. That is
+ * rule R2 made structural: no transition ever REQUIRES a valid trend
+ * (at 40% scan duty the trend is mostly INVALID; the evaluator must
+ * still work there -- worklog 3-L3-A Q4).
+ *
+ * THE DWELL INVARIANT (rule R3 extended): the dwell credit RESETS TO
+ * ZERO only when the threshold condition itself breaks. Trend
+ * evidence can lower the target or pause the credit -- it can NEVER
+ * erase accumulated progress. Rationale: the LEVEL evidence (Kalman
+ * estimate sustained over seconds) is the primary channel; the trend
+ * at 1 Hz is advisory-grade (walker SNR ~3, worklog 3-L3-F); a
+ * one-tick slope flicker must not throw away seconds of level
+ * evidence.
+ */
+
+/*
+ * PROX_UNLOCK_RSSI / PROX_RELOCK_RSSI: the two threshold lines, dBm.
+ *
+ *   unlock: kalman_x > PROX_UNLOCK_RSSI, sustained (dwell) -> PRESENT.
+ *           The UNLOCK event fires on ENTRY to PRESENT.
+ *   relock: kalman_x < PROX_RELOCK_RSSI, sustained (dwell) -> DEPARTING.
+ *           The RELOCK event fires on that transition (from PRESENT).
+ *
+ * The evaluator reads kalman_x (the filtered estimate), NEVER
+ * last_rssi (raw): thresholds on raw RSSI would flicker with every
+ * multipath swing -- the entire L2/L3 pipeline exists to make this
+ * one comparison honest.
+ *
+ * The gap between the two lines is a Schmitt-trigger DEAD BAND:
+ * between them the state HOLDS (no transition either way). A phone
+ * hovering inside the band keeps whatever state it has. Without the
+ * band, a phone parked exactly at one threshold would toggle
+ * unlock/relock at the noise rate; the dwell alone would slow the
+ * chatter, not stop it. (Same construct as BswM mode-request
+ * hysteresis; the dwell is the hysteresis TIME, the band is the
+ * hysteresis LEVEL.)
+ *
+ * CALIBRATION IS LOAD-BEARING (L3 lab, 3-L3-F): RSSI at a given
+ * distance is installation-specific -- the old desk read x=-56 at
+ * 1 m, the new spot reads x=-72 at 1 m. With these defaults at the
+ * new spot, -58 only fires at 20-30 cm and the evaluator would never
+ * unlock. Per installation:
+ *   1. 60 s capture, phone at the door position IN THE POCKET (body
+ *      absorption is 5-15 dB and is part of the real number), note
+ *      the mean kalman_x = X_door.
+ *   2. PROX_UNLOCK_RSSI = round(X_door) - 2 (clears the threshold
+ *      with margin while standing at the door).
+ *   3. 30 s capture at the "definitely leaving" mark (3-4 m), note
+ *      mean x = X_away. PROX_RELOCK_RSSI = round(X_away) + 2.
+ *   4. PROX_TREND_FLOOR_DB_S = 3 * sigma_b from the SAME stationary
+ *      capture (spread of the slope lines).
+ * The defaults below are the original guide's numbers, kept only as
+ * placeholders so the constants exist -- expect to replace all
+ * three at every install.
+ *
+ * Security posture: these thresholds are UX TIMING, not security.
+ * Any attacker with a relay/spoofer beats any RSSI threshold (the
+ * Phase 0 relay-attack discussion). The security boundary is Phase
+ * 4's HMAC. Tuning them loose costs seconds of latency, not safety.
+ */
+#define PROX_UNLOCK_RSSI (-58)
+#define PROX_RELOCK_RSSI (-75)
+
+/*
+ * Nominal dwell: how long the threshold condition must hold (on
+ * kalman_x) before the transition fires, milliseconds.
+ *
+ * "Sustained" is a CREDIT accumulated in the 1 s tick, not a
+ * stopwatch started on condition-true: the credit grows while the
+ * condition holds, FREEZES while the trend contradicts, and resets
+ * only when the condition breaks (the invariant above).
+ *
+ * Why 3 s unlock / 5 s relock (handoff 7.1):
+ *   - unlock 3 s: at 1 Hz that is ~3 MATCHes of above-threshold
+ *     evidence -- enough for the Kalman to have absorbed the crossing
+ *     (not just one lucky fade) and for a pass-through to have shown
+ *     its falling slope. This is temporal debounce, scaled to the
+ *     physics of the channel: a tactile switch bounces for ~10 ms so
+ *     we debounce 20 ms; BLE RSSI "bounces" (multipath/body) for
+ *     ~1-3 s, so we debounce 3-5 s.
+ *   - relock 5 s > unlock 3 s: fail-OPEN on approach, fail-CLOSED on
+ *     departure -- the lock stays released a bit long (user experience)
+ *     rather than snapping shut on a deep pocket fade (user locked
+ *     out). Asymmetric by design; see the lesson's risk table.
+ * Rate independence: dwell is TIME-based, deliberately -- the same
+ * 3 s at 0.35 Hz and 10 Hz input (addendum 3-L1-A: filters are
+ * time-based; the dwell is the last filter in the chain and follows
+ * the same law).
+ */
+#define PROX_UNLOCK_DWELL_MS (3 * 1000)
+#define PROX_RELOCK_DWELL_MS (5 * 1000)
+
+/*
+ * Confirmed dwell (RELOCK path only): the target shrinks from 5 s to
+ * 3 s when the trend CONFIRMS departure (slope <= -floor). Advisory
+ * evidence buys 2 s of latency, never correctness -- the nominal
+ * target above remains the fallback. Locking sooner is the safe
+ * direction (fail-secure), so this is the one place advisory evidence
+ * is allowed to ACCELERATE a transition.
+ *
+ * REMOVED from the UNLOCK path (design iteration, verified in the L4
+ * host simulation before delivery): a 2 s confirmed unlock was tried
+ * first, and the harness falsified it -- a brisk pass-through (4 dB/s,
+ * peak 4 dB above threshold) UNLOCKED, because the 5 s trend window
+ * still showed "approaching" for ~2.5 s after the direction flip, so
+ * the confirmation fired on stale positive slope exactly when it
+ * should not. The trend lags direction changes by ~W/2; a target
+ * reachable inside that lag is reachable by a passer-by. Cost of the
+ * removal: ~1 s of unlock latency on the return edge. Resurrection
+ * criterion: only if the Phase 6 (10 Hz) lab shows slope latency well
+ * under 1 s AND pass-through immunity re-validated at that rate.
+ */
+#define PROX_RELOCK_DWELL_CONFIRM_MS (3 * 1000)
+
+/*
+ * PROX_TREND_FLOOR_DB_S: direction trust floor, dB/s. |slope| below
+ * the floor is NOISE, not direction -- treated as neutral even when
+ * trend_valid == 1 (rule R4).
+ *
+ * Provisional 1.5: calibrated from the L3 labs as 3*sigma_b
+ * (stationary: 0.8 dB/s at the old desk spot, 1.76 at the new open
+ * spot -- the floor is ENVIRONMENT-dependent; calibrate per install,
+ * procedure above). Walker peaks measured +2.8/-3.0 dB/s stand
+ * ~1.6-2x above the calibrated floor; stroll pace ~1.1 dB/s is
+ * below it -- the trend honestly abstains there and the nominal
+ * dwell carries the decision (advisory grade, by design).
+ *
+ * Phase 6 (10 Hz app): n=10-11 per window, sigma_b ~0.35-0.4,
+ * floor ~1.0-1.2 -- the trend hardens from advisory to reliable.
+ */
+#define PROX_TREND_FLOOR_DB_S 1.5f
+
+/*
+ * PROX_TRACK_FLOOR_RSSI: first-sight allocation floor, dBm. A NEW
+ * phone whose first MATCH is at/below this is not even allocated a
+ * slot (proximity_on_match returns -ERANGE). Handoff 7.1's "ABSENT ->
+ * APPROACHING: first MATCH (RSSI > -90)".
+ *
+ * This is REGISTRY HYGIENE, not proximity logic: it keeps far-away
+ * phones (the bedroom at -85, the neighbor's install at -88) from
+ * squatting on 8 slots for 30 s each. Allocation-time ONLY: a phone
+ * already tracked that fades deep is NOT evicted -- evicting
+ * mid-track would throw away live Kalman state on every deep fade;
+ * the DEPARTING exits and the 30 s timeout handle genuine departure.
+ *
+ * It also doubles as the DEPARTING "out of range" exit: kalman_x <
+ * this floor in DEPARTING frees the slot (handoff 7.1's "OR when RSSI
+ * drops below -90 dBm"). Two roles, one number -- both mean "the
+ * link is not worth acting on".
+ */
+#define PROX_TRACK_FLOOR_RSSI (-90)
+
+/*
+ * PROX_DEPARTING_SILENCE_MS: in DEPARTING, no MATCH for this long ->
+ * slot freed (the GONE log line). Handoff 7.1: "no MATCH for >5s
+ * while in DEPARTING".
+ *
+ * Why shorter than the 30 s timeout: DEPARTING means the phone is
+ * leaving -- RSSI falling, catch rate collapsing with the link
+ * budget. Silence in DEPARTING is departure confirmation, not
+ * pocket doze. 5 s at the L4 lab's 100% scan duty is decisive; in
+ * L5 this state runs 100% duty too (handoff 7.3) for exactly this
+ * reason -- at 40% duty a catch gap > 5 s happens ~12% of the time
+ * (0.65^5) and would false-fire this exit (lesson exercise Q3).
+ */
+#define PROX_DEPARTING_SILENCE_MS (5 * 1000)
+
+/*
+ * PROX_EVIDENCE_FRESH_MS: the evidence horizon. A MATCH older than
+ * this and the evaluator does not run at all: the dwell credit
+ * FREEZES (no reset -- silence is absent evidence, not contrary
+ * evidence; a pocket-dozed phone that resumes above the threshold
+ * picks its credit back up).
+ *
+ * Deliberately an ALIAS of TREND_WINDOW_MS -- one number, one
+ * meaning: the horizon within which we hold BOTH a direction claim
+ * (the trend window) and a level claim worth acting on. Beyond 5 s
+ * of silence the trend has already self-invalidated; the Kalman x
+ * is a 5 s old photograph. Splitting the two constants apart is
+ * allowed but understand they are tied philosophically: freshness
+ * of level and freshness of direction are the same freshness.
+ */
+#define PROX_EVIDENCE_FRESH_MS TREND_WINDOW_MS
+
 /* --- State machine ---------------------------------------------------- */
 
 /*
@@ -339,31 +554,57 @@
  *               Phase 6 app. 100% duty removes OUR 60% drop rate; it does
  *               not add samples.)
  *               In ch1: we ENTER this state on first MATCH and stay here.
- *               In ch4: we EXIT to PRESENT when RSSI > -58 dBm sustained >3s.
+ *               ch4 delivered: we EXIT to PRESENT when kalman_x >
+ *               PROX_UNLOCK_RSSI and the dwell credit reaches 3 s
+ *               (nominal only -- the trend can PAUSE the credit but
+ *               never accelerates the unlock; see the confirmed-dwell
+ *               comment for why).
  *
  *   PRESENT     Phone is close (RSSI > -58 dBm sustained). UNLOCK fires on
  *               entry to this state. Scan returns to slow duty (ch5; current
  *               params 160/400 units = 100/250 ms = 40% duty, not 25% --
  *               the old label divided a ms window by a unit interval).
  *               In L1: never entered (transition is L4 work).
- *               In L4: we EXIT to DEPARTING when RSSI < -75 dBm sustained >5s.
+ *               ch4 delivered: we EXIT to DEPARTING when kalman_x <
+ *               PROX_RELOCK_RSSI and the dwell credit reaches its target
+ *               (3 s if the trend confirms departure / 5 s nominal).
+ *               UNLOCK fires on ENTRY to this state.
  *
  *   DEPARTING   Phone is leaving (RSSI < -75 dBm sustained). RELOCK fires on
  *               entry to this state. Scan switches to 100% duty (L5) to confirm
  *               departure.
  *               In L1: never entered (transition is L4 work).
- *               In L4: we EXIT to ABSENT when no MATCH for >5s while in
- *                      DEPARTING, OR when RSSI drops below -90 dBm (out of range).
+ *               ch4 delivered: EXIT to PRESENT if the user walks back in
+ *                      (x > unlock threshold + dwell -- the RETURN EDGE,
+ *                      added in L4: the handoff 7.1 machine had no way
+ *                      back except full re-discovery as a new phone).
+ *                      EXIT the slot (freed) when silent for
+ *                      PROX_DEPARTING_SILENCE_MS or when kalman_x <
+ *                      PROX_TRACK_FLOOR_RSSI. "Exit to ABSENT" is
+ *                      implemented as FREEING the slot: in this design
+ *                      ABSENT is slot-freedom, not a live state value --
+ *                      a freed slot IS the absent phone. The GONE log
+ *                      line is the audit record.
  *
- * State diagram:
+ * State diagram (ch4 delivered):
  *
- *   ABSENT --first MATCH--> APPROACHING --RSSI>-58 + 3s dwell--> PRESENT
- *                                                              |
- *                                                              v
- *   ABSENT <--no MATCH 30s-- DEPARTING <--RSSI<-75 + 5s dwell-- PRESENT
+ *   ABSENT --first MATCH (rssi > -90)--> APPROACHING
  *
- * The L1 implementation only fires: ABSENT -> APPROACHING (on MATCH) and
- * Any -> ABSENT (on 30s timeout). The intermediate transitions are L4 work.
+ *   APPROACHING --x > UNLOCK + dwell 3s--> PRESENT         [UNLOCK event]
+ *   DEPARTING   --x > UNLOCK + dwell 3s--> PRESENT         [UNLOCK event,
+ *                                                            the return edge]
+ *   PRESENT     --x < RELOCK + dwell(3s|5s)--> DEPARTING   [RELOCK event]
+ *   DEPARTING   --silent > PROX_DEPARTING_SILENCE_MS or x < -90-->
+ *                                                        (slot freed; GONE)
+ *   any state   --no MATCH 30 s--> (slot freed; TIMEOUT)
+ *
+ * dwell(A|B): B nominal, A when the trend CONFIRMS departure (relock
+ * path only). The trend can also PAUSE the credit on either path
+ * (contradiction) -- see the evaluator decision table with the Phase 3
+ * ch4 tunables, and the dwell invariant: the trend never resets the
+ * credit; only the threshold condition breaking does. The L1 skeleton
+ * fired only ABSENT -> APPROACHING and the 30 s timeout; ch4 fills in
+ * the rest.
  *
  * Why a state machine (vs. just thresholding RSSI directly):
  *   - Thresholding alone causes flicker: multipath nulls dip RSSI below -75
@@ -408,11 +649,12 @@ extern const char *const phone_state_name[4];
  * Threading: only the system workqueue touches this struct (via
  * proximity_on_match and proximity_tick). No locking needed.
  *
- * Layout (Phase 3 ch3): fields are ordered largest-alignment-first, which
- * eliminates ALL padding: sizeof = 136 bytes/slot exactly (was 112 with
- * the ch1 fields; the growth is the 80-byte trend ring). 8 slots = 1088
- * bytes total -- still trivial vs 256 KB RAM. Offset table inside the
- * struct; verified by BUILD_ASSERT in proximity.c.
+ * Layout (Phase 3 ch4): fields are ordered largest-alignment-first.
+ * sizeof = 144 bytes/slot (L3 was 136; +4 for dwell_ms, and 140 rounds
+ * up to the struct's 8-byte alignment -- the 4 tail padding bytes are
+ * DOCUMENTED, not accidental). 8 slots = 1152 bytes total -- still
+ * trivial vs 256 KB RAM. Offset table inside the struct; verified by
+ * BUILD_ASSERT in proximity.c.
  *
  * Note on last_match_time vs. handoff's last_match_age:
  *   The handoff document (section 7.4) specified last_match_age as a uint32_t
@@ -427,27 +669,29 @@ extern const char *const phone_state_name[4];
  */
 struct phone_track {
     /*
-     * Offset table (Phase 3 ch3 ordering, zero padding -- we verify with the
-     * BUILD_ASSERT in proximity.c):
+     * Offset table (Phase 3 ch4 ordering, largest-alignment-first -- verify
+     * with the BUILD_ASSERT in proximity.c):
      *
      *   0   last_match_time   int64_t  (8)
      *   8   state_enter_time  int64_t  (8)
      *   16  match_count       uint32_t (4)
-     *   20  kalman_x          float    (4)
-     *   24  kalman_p          float    (4)
-     *   28  trend_x[10]       float    (40)
-     *   68  trend_t[10]       uint32_t (40)
-     *   108 trend_slope       float    (4)
-     *   112 kalman_gated      uint8_t  (1)
-     *   113 kalman_reject_str  uint8_t  (1)
-     *   114 uuid[16]          uint8_t  (16)
-     *   130 in_use            bool     (1)
-     *   131 state             uint8_t  (1)
-     *   132 last_rssi         int8_t   (1)
-     *   133 trend_head        uint8_t  (1)
-     *   134 trend_count       uint8_t  (1)
-     *   135 trend_valid       uint8_t  (1)
-     *   ---- sizeof = 136 (alignment 8, multiple of 8) ----
+     *   20  dwell_ms          uint32_t (4)
+     *   24  kalman_x          float    (4)
+     *   28  kalman_p          float    (4)
+     *   32  trend_x[10]       float    (40)
+     *   72  trend_t[10]       uint32_t (40)
+     *   112 trend_slope       float    (4)
+     *   116 kalman_gated      uint8_t  (1)
+     *   117 kalman_reject_str  uint8_t  (1)
+     *   118 uuid[16]          uint8_t  (16)
+     *   134 in_use            bool     (1)
+     *   135 state             uint8_t  (1)
+     *   136 last_rssi         int8_t   (1)
+     *   137 trend_head        uint8_t  (1)
+     *   138 trend_count       uint8_t  (1)
+     *   139 trend_valid       uint8_t  (1)
+     *   140 (4 bytes tail padding to the 8-byte struct alignment)
+     *   ---- sizeof = 144 (multiple of 8) ----
      */
 
     /* --- Match + state timing --- */
@@ -456,6 +700,21 @@ struct phone_track {
 
     /* --- Kalman filter (populated since L2, on every MATCH) --- */
     uint32_t match_count;          /* total MATCHes since alloc (debug) */
+    /*
+     * Dwell credit toward the CURRENT state's exit condition, ms
+     * (Phase 3 ch4). Grows by PROX_TICK_MS each tick the threshold
+     * condition holds; freezes while the trend contradicts (the
+     * invariant: only the condition breaking resets it); zeroed on
+     * every state transition (transition_phone owns that -- the
+     * credit belongs to the OLD state's exit).
+     *
+     * Bounded in practice by the largest target (5 s) + pause slack;
+     * uint32 ms wraps only after 49.7 days of CONTINUOUS hold, which
+     * no physical RSSI trajectory can sustain (a sustained +1.5 dB/s
+     * walk exhausts the dynamic range in ~40 s). No overflow guard
+     * needed -- guards-by-design, same policy as kalman_update.
+     */
+    uint32_t dwell_ms;             /* Phase 3 ch4 evaluator accumulator */
     float    kalman_x;             /* estimate of true RSSI now, dBm */
     float    kalman_p;             /* variance of estimate, dB^2 */
 
@@ -498,6 +757,50 @@ struct phone_track {
 /* --- Public API ------------------------------------------------------- */
 
 /*
+ * Phase 3 ch4: proximity events.
+ *
+ * UNLOCK fires on every ENTRY to PRESENT: from APPROACHING (first
+ * arrival) or from DEPARTING (the user came back). RELOCK fires on
+ * PRESENT -> DEPARTING (the only entry path to DEPARTING in this
+ * machine -- and the only context where "relock" means anything:
+ * the lock was open).
+ *
+ * Callback contract:
+ *   - Called in SYSTEM WORKQUEUE context (the proximity tick). Must
+ *     not block, must not call back into the proximity module.
+ *   - uuid points into the slot's storage: valid for the duration of
+ *     the call ONLY. Copy it if you need it later.
+ *   - The rich audit lines (uuid, x, slope, dwell reached) are logged
+ *     by proximity.c itself at INF; the callback is for ACTUATION
+ *     (relay, LEDs, and later the Phase 5 gate state machine).
+ *     Layering: detection emits events, the owner of the hardware
+ *     consumes them.
+ *
+ * Register ONCE from main() BEFORE bt_enable() (so no event can fire
+ * unregistered); passing NULL unregisters. The pointer is plain
+ * state -- safe because registration completes before the system
+ * workqueue ever runs the evaluator that fires events.
+ *
+ * Phase 4 note: this is the authentication interception point. A
+ * future auth gate sits between these events and the relay, and the
+ * evaluator itself will consume the phone's auth status.
+ */
+enum proximity_event {
+    PROX_EVENT_UNLOCK = 0,   /* entered PRESENT: person at the door */
+    PROX_EVENT_RELOCK = 1,   /* PRESENT -> DEPARTING: person confirmed leaving */
+};
+
+typedef void (*proximity_event_cb_t)(enum proximity_event evt,
+                                     uint8_t slot,
+                                     const uint8_t *uuid);
+
+/*
+ * Register the event callback (see the contract above).
+ * Returns 0 (plain pointer store; cannot fail).
+ */
+int proximity_register_event_cb(proximity_event_cb_t cb);
+
+/*
  * Initialize the proximity tracking module.
  *
  * Call this ONCE from bt_ready_cb(), after scan_start().
@@ -525,7 +828,10 @@ int proximity_init(void);
  *   2. If not found, allocate a free slot, copy UUID, set state=ABSENT
  *   3. Update last_rssi, last_match_time, match_count
  *   4. If state == ABSENT, transition to APPROACHING (log at INF)
- *   5. (L4 will add: if RSSI threshold met, transition to PRESENT, fire unlock)
+ *   5. (ch4 delivered: the threshold/dwell transitions live in the TICK's
+ *      evaluator, evaluate_phone -- NOT here. Rule R5: level and trend
+ *      are consumed in the same tick that computed them. The one thing
+ *      added HERE is the first-sight floor below.)
  *
  * Threading: runs in system workqueue context (scan_work_handler).
  * NEVER call this from scan_cb (BT RX context) -- it does too much work.
@@ -536,6 +842,9 @@ int proximity_init(void);
  *
  * Returns: slot index (0..MAX_TRACKED_PHONES-1) on success,
  *          -ENOSPC if registry full (all 8 slots in use),
+ *          -ERANGE if a NEW phone's first RSSI is <=
+ *                  PROX_TRACK_FLOOR_RSSI (not tracked -- registry
+ *                  hygiene, Phase 3 L4),
  *          -EINVAL on bad input (uuid NULL).
  */
 int proximity_on_match(const uint8_t *uuid, int8_t rssi);

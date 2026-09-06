@@ -4,14 +4,14 @@
  *
  * See proximity.h for top-level documentation.
  *
- * L1 scope:
+ * ch1 scope:
  *   - phones[] static array of MAX_TRACKED_PHONES slots
  *   - proximity_init: zero array + schedule first tick
  *   - proximity_on_match: lookup-or-alloc + update fields + ABSENT->APPROACHING
  *   - proximity_tick: 30s timeout cleanup + DBG state log
  *   - All transitions logged at INF for audit
  *
- * Phase 3 ch2 changes:
+ * Phase 3 ch2 changes (search for "Phase 3 ch2" to find them):
  *   1. kalman_update(): time-normalized scalar Kalman filter
  *      (design addendum 3-L1-A point (ii)):
  *        - dt from k_uptime timestamps, q_step = Q_PER_SEC * dt
@@ -48,6 +48,35 @@
  *   7. kalman_gated uint16_t -> uint8_t, saturating at 255 (pays for
  *      the streak byte; sizeof(phone_track) stays 136).
  *
+ * Phase 3 ch4 changes (search for "Phase 3 ch4"):
+ *   1. evaluate_phone(): the evaluator -- threshold condition + dwell
+ *      credit + trend modulation, per the decision table in
+ *      proximity.h (contradiction pauses the credit; INVALID or
+ *      below-floor is neutral; the nominal target runs. Confirm
+ *      exists ONLY on the relock path, 5 s -> 3 s, fail-secure).
+ *      DELIBERATELY no confirm on the unlock path: the L4 host
+ *      simulation falsified a 2 s confirmed unlock (pass-through
+ *      unlocked on the trend's direction lag).
+ *   2. transition_phone(): fires UNLOCK/RELOCK events (registered
+ *      callback + INF audit lines carrying the decision evidence:
+ *      x, slope, dwell reached) and resets the dwell credit on every
+ *      transition (the credit belongs to the old state's exit).
+ *   3. proximity_tick_handler(): DEPARTING exits (5 s silence or
+ *      x < -90 -> slot freed, distinct GONE audit lines) + the
+ *      evidence-freshness gate (dwell FREEZES, never resets, while
+ *      the newest MATCH is older than PROX_EVIDENCE_FRESH_MS) +
+ *      evaluate_phone() right after trend_compute (rule R5).
+ *   4. proximity_on_match(): first-sight floor (-ERANGE for a new
+ *      phone at/below PROX_TRACK_FLOOR_RSSI) -- registry hygiene,
+ *      allocation-time only.
+ *   5. struct phone_track: + uint32_t dwell_ms; 136 -> 144 bytes/slot
+ *      (4 documented tail-padding bytes; BUILD_ASSERT + offset
+ *      table updated).
+ *   6. tick DBG snapshot: + dwell=%ums (the lab's modulation view:
+ *      watch the credit climb, pause, and reset).
+ *   7. fmt_slope(): the only sanctioned way to print trend_slope --
+ *      makes rule R1 structural (never read the slope without
+ *      checking trend_valid).
  *
  * Float discipline (Cortex-M4F, single-precision FPv4 FPU):
  *   - float only, never double; ALL float constants f-suffixed
@@ -93,12 +122,26 @@ LOG_MODULE_REGISTER(proximity, LOG_LEVEL_DBG);
 
 static struct phone_track phones[MAX_TRACKED_PHONES];
 
-/* Phase 3 ch3: verify the documented layout (offset table in proximity.h).
+/* Phase 3 ch4: verify the documented layout (offset table in proximity.h).
  * If this fires after you edit the struct, update the table -- the docs
  * and the code must not drift apart. BUILD_ASSERT is compile-time only,
  * zero runtime cost (<zephyr/toolchain.h>, pulled in by kernel.h).
  */
-BUILD_ASSERT(sizeof(struct phone_track) == 136);
+BUILD_ASSERT(sizeof(struct phone_track) == 144);
+
+/*
+ * Phase 3 ch4: actuation event callback (registered by main via
+ * proximity_register_event_cb). NULL until then. Fired from
+ * transition_phone -- see the contract in proximity.h: system
+ * workqueue context, must not block.
+ */
+static proximity_event_cb_t event_cb;
+
+/* Phase 3 ch4: forward declarations -- transition_phone (below) formats
+ * the UNLOCK/RELOCK audit lines with helpers defined later in this file.
+ */
+static void fmt_float2(char *out, size_t len, float v);
+static void fmt_slope(char *out, size_t len, const struct phone_track *ph);
 
 /* Indexed by enum phone_state. Must stay in sync with the enum. */
 const char *const phone_state_name[4] = {
@@ -266,13 +309,14 @@ static void free_phone(int slot)
  * (in_use=false) without a state transition log (the TIMEOUT log line is
  * the audit record).
  *
- * L4 will add calls for:
- *   - APPROACHING -> PRESENT (on RSSI + dwell) -- with unlock side effect
- *   - PRESENT -> DEPARTING (on RSSI + dwell) -- with relock side effect
- *   - DEPARTING -> ABSENT (on extended timeout)
- *
- * The state machine is intentionally simple: no guards, no actions beyond
- * logging. L4 will add unlock/relock side effects on PRESENT/DEPARTING entry.
+ * ch4 delivered: transition_phone is called by evaluate_phone (the
+ * tick's evaluator) for APPROACHING -> PRESENT, DEPARTING -> PRESENT
+ * (the return edge) and PRESENT -> DEPARTING; the UNLOCK/RELOCK
+ * events + audit lines fire below on the actuation-relevant entries,
+ * and the dwell credit is reset here on EVERY transition. DEPARTING
+ * exits to "ABSENT" are NOT transitions -- they free the slot directly
+ * (see proximity_tick_handler, the GONE lines): a freed slot IS the
+ * absent phone.
  *
  * Why a separate function (vs. inline assignment in callers):
  *   - Single point of truth for "state transition happened"
@@ -286,8 +330,19 @@ static void transition_phone(int slot, uint8_t new_state)
         return;  /* no-op, don't log */
     }
 
+    /* Decision evidence, captured BEFORE the mutation: the audit lines
+     * below must show what the evaluator SAW, and dwell_ms resets as
+     * part of the transition. (Phase 3 ch4.)
+     */
+    uint32_t dwell_at_fire = phones[slot].dwell_ms;
+
     phones[slot].state = new_state;
     phones[slot].state_enter_time = k_uptime_get();
+    /* The dwell credit belongs to the OLD state's exit condition; the
+     * new state starts its own from zero. Centralized here so no
+     * caller can forget the reset. (Phase 3 ch4.)
+     */
+    phones[slot].dwell_ms = 0U;
 
     char uuid_str[MSD_LEN_UUID * 2U + 1U];
     format_uuid_hex(phones[slot].uuid, uuid_str, sizeof(uuid_str));
@@ -296,6 +351,39 @@ static void transition_phone(int slot, uint8_t new_state)
             uuid_str, slot,
             phone_state_name[old_state],
             phone_state_name[new_state]);
+
+    /*
+     * Phase 3 ch4 side effects. UNLOCK fires on every ENTRY to PRESENT:
+     * from APPROACHING (first arrival) or from DEPARTING (the user came
+     * back) -- both mean "person at the door, release the strike".
+     * RELOCK fires only on PRESENT -> DEPARTING: the only entry path to
+     * DEPARTING in this machine, and the only context where "relock"
+     * means anything (the lock was open).
+     *
+     * The audit line carries the decision evidence (x, slope, dwell
+     * reached) -- the "why did the gate unlock at 14:23:05" record
+     * promised in this file's ch1 header.
+     */
+    if (new_state == PHONE_STATE_PRESENT) {
+        char xs[12], sl[12];
+        fmt_float2(xs, sizeof(xs), phones[slot].kalman_x);
+        fmt_slope(sl, sizeof(sl), &phones[slot]);
+        LOG_INF("UNLOCK: uuid=%s slot=%d x=%s slope=%s dwell=%ums",
+                uuid_str, slot, xs, sl, (unsigned)dwell_at_fire);
+        if (event_cb != NULL) {
+            event_cb(PROX_EVENT_UNLOCK, slot, phones[slot].uuid);
+        }
+    } else if (new_state == PHONE_STATE_DEPARTING &&
+               old_state == PHONE_STATE_PRESENT) {
+        char xs[12], sl[12];
+        fmt_float2(xs, sizeof(xs), phones[slot].kalman_x);
+        fmt_slope(sl, sizeof(sl), &phones[slot]);
+        LOG_INF("RELOCK: uuid=%s slot=%d x=%s slope=%s dwell=%ums",
+                uuid_str, slot, xs, sl, (unsigned)dwell_at_fire);
+        if (event_cb != NULL) {
+            event_cb(PROX_EVENT_RELOCK, slot, phones[slot].uuid);
+        }
+    }
 }
 
 /* --- Kalman filter (Phase 3 ch2) ---------------------------------------- */
@@ -332,6 +420,24 @@ static void fmt_float2(char *out, size_t len, float v)
         (void)snprintk(out, len, "-%d.%02d", (int)(-whole), (int)(-frac));
     } else {
         (void)snprintk(out, len, "%d.%02d", (int)whole, (int)frac);
+    }
+}
+
+/*
+ * fmt_slope: "1.25" or "INVALID" for the audit/tick lines.
+ * (Phase 3 chL4.)
+ *
+ * Rule R1 made STRUCTURAL: trend_slope is never read anywhere in
+ * this module without checking trend_valid first -- this helper is
+ * the only sanctioned way to render the slope, so the rule cannot
+ * be forgotten at a call site.
+ */
+static void fmt_slope(char *out, size_t len, const struct phone_track *ph)
+{
+    if (ph->trend_valid) {
+        fmt_float2(out, len, ph->trend_slope);
+    } else {
+        (void)snprintk(out, len, "INVALID");
     }
 }
 
@@ -659,6 +765,100 @@ static void trend_compute(int slot, int64_t now_ms)
             slot, sb, (unsigned)n, (int)span_ms);
 }
 
+/* --- Evaluator: thresholds + dwell + trend modulation (Phase 3 ch4) ---- */
+
+/*
+ * evaluate_phone: run the current state's exit condition for one phone.
+ * (Phase 3 L4; the decision table and the dwell invariant are documented
+ * with the PROX_* ch4 tunables in proximity.h -- read that first.)
+ *
+ * Runs in the 1 s tick, IMMEDIATELY AFTER trend_compute for the same
+ * phone: rule R5 -- level and trend are consumed in the same tick that
+ * computed them, one consistent snapshot, serialized on the system
+ * workqueue.
+ *
+ * The structure is two mirrored branches:
+ *
+ *   unlock direction (APPROACHING or DEPARTING): condition x > UNLOCK
+ *     -> PRESENT + UNLOCK. In DEPARTING this is the RETURN edge (the
+ *     user walked back); same condition, same 3 s target as
+ *     APPROACHING. Trend's role here: pause only, never confirm.
+ *   relock direction (PRESENT): condition x < RELOCK -> DEPARTING +
+ *     RELOCK.
+ *
+ * Each branch is three moves:
+ *   1. condition broken -> dwell = 0 and out. THE ONLY RESET (the
+ *      invariant). Everything else modulates.
+ *   2. trend contradicts -> credit frozen this tick (pass-through /
+ *      returner protection). On the RELOCK path only, a confirming
+ *      trend also shrinks the target (5 s -> 3 s, fail-secure). The
+ *      unlock path has NO confirm -- the host simulation falsified it
+ *      (pass-through unlock on the trend's direction lag; see
+ *      proximity.h). Neutral (INVALID or |slope| < floor) -> nominal.
+ *   3. credit >= target -> transition (transition_phone resets the
+ *      credit, fires the event, writes the audit lines).
+ *
+ * Why the pauses are self-limiting (no stuck states): a PAUSE on the
+ * unlock path requires slope <= -floor sustained -- but a sustained
+ * negative slope pulls kalman_x down through the threshold within
+ * ~2-4 s, which RESETS the credit via move 1. Same argument, mirrored,
+ * for the relock pause. A dwell can only be paused, never deadlocked.
+ */
+static void evaluate_phone(int slot)
+{
+    struct phone_track *ph = &phones[slot];
+
+    /* Classify the trend (rules R1, R4, R6): INVALID or below-floor
+     * slopes classify as NEUTRAL -- both booleans false.
+     */
+    bool trend_up   = ph->trend_valid &&
+                      (ph->trend_slope >=  PROX_TREND_FLOOR_DB_S);
+    bool trend_down = ph->trend_valid &&
+                      (ph->trend_slope <= -PROX_TREND_FLOOR_DB_S);
+
+    if (ph->state == PHONE_STATE_PRESENT) {
+        /* --- relock direction: PRESENT -> DEPARTING --- */
+        if (ph->kalman_x >= (float)PROX_RELOCK_RSSI) {
+            ph->dwell_ms = 0U;   /* condition broken: the only reset */
+            return;
+        }
+        if (!trend_up) {
+            /* trend_up = below the relock line but RISING: a returner
+             * walking back through the band -- pause so they can pass
+             * back above UNLOCK without the gate locking behind them.
+             */
+            ph->dwell_ms += PROX_TICK_MS;
+        }
+        uint32_t target = trend_down ? PROX_RELOCK_DWELL_CONFIRM_MS
+                                     : PROX_RELOCK_DWELL_MS;
+        if (ph->dwell_ms >= target) {
+            transition_phone(slot, PHONE_STATE_DEPARTING);
+        }
+    } else {
+        /* --- unlock direction: APPROACHING/DEPARTING -> PRESENT --- */
+        if (ph->kalman_x <= (float)PROX_UNLOCK_RSSI) {
+            ph->dwell_ms = 0U;   /* condition broken: the only reset */
+            return;
+        }
+        if (!trend_down) {
+            /* trend_down = above the unlock line but RECEDING: a
+             * pass-through -- pause the credit; the level condition
+             * will break on its own within seconds and do the reset.
+             */
+            ph->dwell_ms += PROX_TICK_MS;
+        }
+        /* Nominal target only -- the unlock path deliberately has NO
+         * confirmed shortcut (the ch4 host simulation falsified it: a
+         * brisk pass-through unlocked on the trend's ~W/2 direction
+         * lag; see the confirmed-dwell comment in proximity.h). The
+         * trend's entire job on THIS path is the pause above.
+         */
+        if (ph->dwell_ms >= PROX_UNLOCK_DWELL_MS) {
+            transition_phone(slot, PHONE_STATE_PRESENT);
+        }
+    }
+}
+
 /* --- Periodic tick ---------------------------------------------------- */
 
 static void proximity_tick_handler(struct k_work *work);
@@ -672,7 +872,8 @@ K_WORK_DELAYABLE_DEFINE(proximity_tick_work, proximity_tick_handler);
  * For each tracked phone:
  *   - Compute time since last MATCH (now - last_match_time)
  *   - If > PROX_TIMEOUT_MS (30s): free the slot (state -> ABSENT, in_use=false)
- *   - (L4 will add: check dwell timers for APPROACHING->PRESENT etc.)
+ *   - ch4 delivered: DEPARTING exits, trend refresh, freshness gate,
+ *     and evaluate_phone (dwell timers + transitions) below
  *   - Log state + time-in-state at DBG level (for dev observability)
  *
  * Threading: runs in system workqueue context.
@@ -709,7 +910,37 @@ static void proximity_tick_handler(struct k_work *work)
             continue;
         }
 
-        /* L4 will add: dwell timer checks for APPROACHING->PRESENT etc. */
+        /* Phase 3 ch4: DEPARTING exits (handoff 7.1: "no MATCH for >5 s
+         * in DEPARTING, OR RSSI below -90 dBm"). Implemented as FREEING
+         * the slot: ABSENT is slot-freedom in this design (a freed slot
+         * IS the absent phone -- there is no live ABSENT state to
+         * transition into). Two distinct GONE lines so the log tells you
+         * WHICH exit fired -- same audit principle as TIMEOUT.
+         *
+         * Checked BEFORE trend_compute/evaluator: both exits decide on
+         * raw fields (since_match, kalman_x), no trend needed, and a
+         * gone phone must not spend a tick evaluating.
+         */
+        if (phones[i].state == PHONE_STATE_DEPARTING) {
+            if (since_match > PROX_DEPARTING_SILENCE_MS) {
+                char uuid_str[MSD_LEN_UUID * 2U + 1U];
+                format_uuid_hex(phones[i].uuid, uuid_str, sizeof(uuid_str));
+                LOG_INF("GONE: uuid=%s slot=%d (departing, no MATCH for %lldms)",
+                        uuid_str, i, (long long)since_match);
+                free_phone(i);
+                continue;
+            }
+            if (phones[i].kalman_x < (float)PROX_TRACK_FLOOR_RSSI) {
+                char uuid_str[MSD_LEN_UUID * 2U + 1U];
+                char xs[12];
+                format_uuid_hex(phones[i].uuid, uuid_str, sizeof(uuid_str));
+                fmt_float2(xs, sizeof(xs), phones[i].kalman_x);
+                LOG_INF("GONE: uuid=%s slot=%d (departing, x=%s below %d floor)",
+                        uuid_str, i, xs, PROX_TRACK_FLOOR_RSSI);
+                free_phone(i);
+                continue;
+            }
+        }
 
         /* Phase 3 ch3: refresh the trend slope (LSQ over the 5 s window).
          * 1 s cadence is plenty -- the slope is a 5 s-window average that
@@ -717,15 +948,24 @@ static void proximity_tick_handler(struct k_work *work)
          */
         trend_compute(i, now);
 
+        /* Phase 3 ch4: evidence-freshness gate. If the newest MATCH is
+         * older than the evidence horizon (PROX_EVIDENCE_FRESH_MS, an
+         * alias of TREND_WINDOW_MS -- deliberately the same 5 s), the
+         * level estimate is a 5 s old photograph and the trend has
+         * already self-invalidated: FREEZE the dwell credit (do NOT
+         * reset -- R3: silence is absent evidence, not contrary
+         * evidence; a pocket-dozed phone that resumes above the
+         * threshold picks its credit back up) and skip the evaluator.
+         */
+        if (since_match <= PROX_EVIDENCE_FRESH_MS) {
+            evaluate_phone(i);
+        }
+
         /* DBG: per-tick per-phone snapshot for dev observability.
-         * Visible only when CONFIG_LOG_DEFAULT_LEVEL=4 (DBG).
-         * Off in production (CONFIG_LOG_DEFAULT_LEVEL=3 = INF).
-         *
-         * To see ticks during algorithm tuning, temporarily set:
-         *   CONFIG_LOG_DEFAULT_LEVEL=4
-         * in prj.conf, rebuild, flash. You'll see ~8 lines/second when 8
-         * phones are tracked. Useful for verifying the state machine is
-         * stable. Turn back to 3 for normal runs.
+         * ALWAYS visible: this module is pinned to LOG_LEVEL_DBG
+         * (Phase 3 L3-E, "quiet world, loud pins") -- the kalman:/trend:/
+         * tick: lines are the permanent telemetry view. No Kconfig
+         * toggling needed; volume is bounded (~1 line/s per phone).
          */
         int64_t time_in_state = now - phones[i].state_enter_time;
 
@@ -735,17 +975,14 @@ static void proximity_tick_handler(struct k_work *work)
         char xs[12], ps[12], sl[12];
         fmt_float2(xs, sizeof(xs), phones[i].kalman_x);
         fmt_float2(ps, sizeof(ps), phones[i].kalman_p);
-        if (phones[i].trend_valid) {
-            fmt_float2(sl, sizeof(sl), phones[i].trend_slope);
-        } else {
-            (void)snprintk(sl, sizeof(sl), "INVALID");
-        }
+        fmt_slope(sl, sizeof(sl), &phones[i]);
 
         LOG_DBG("tick: slot=%d state=%s rssi=%d x=%s p=%s slope=%s "
-                "matches=%u gated=%u age since last match=%lldms in_state=%lldms",
+                "matches=%u gated=%u dwell=%ums age=%lldms in_state=%lldms",
                 i, phone_state_name[phones[i].state],
                 phones[i].last_rssi, xs, ps, sl, phones[i].match_count,
                 (unsigned)phones[i].kalman_gated,
+                (unsigned)phones[i].dwell_ms,
                 (long long)since_match, (long long)time_in_state);
     }
 
@@ -796,6 +1033,31 @@ int proximity_on_match(const uint8_t *uuid, int8_t rssi)
     bool is_new = (slot < 0);
 
     if (is_new) {
+        /*
+         * Phase 3 ch4: first-sight floor (handoff 7.1: "ABSENT ->
+         * APPROACHING: first MATCH (RSSI > -90)"). Allocation-time
+         * ONLY: a phone already tracked that fades deep is handled by
+         * the DEPARTING exits / 30 s timeout -- evicting mid-track
+         * would throw away live Kalman state on every deep fade.
+         *
+         * This is REGISTRY HYGIENE, not proximity logic: it keeps
+         * far-away phones (the one in the bedroom at -85) from
+         * squatting on slots for 30 s each. Honest limits: any of OUR
+         * phones already above the floor keeps its slot until timeout
+         * no matter how far it then fades; the real filter for
+         * foreign traffic is the CID+version check in scan.c (and,
+         * in Phase 4, authentication).
+         *
+         * DBG, not WRN: routine, not exceptional -- every distant
+         * compatible phone logs here on each catch.
+         */
+        if (rssi <= PROX_TRACK_FLOOR_RSSI) {
+            char uuid_str[MSD_LEN_UUID * 2U + 1U];
+            format_uuid_hex(uuid, uuid_str, sizeof(uuid_str));
+            LOG_DBG("far phone: uuid=%s rssi=%d <= %d, not tracked",
+                    uuid_str, rssi, PROX_TRACK_FLOOR_RSSI);
+            return -ERANGE;
+        }
         slot = alloc_phone(uuid);
         if (slot < 0) {
             /* Registry full. Log at WRN. Phone will be tracked on a future
@@ -844,18 +1106,11 @@ int proximity_on_match(const uint8_t *uuid, int8_t rssi)
      * If the phone was already in APPROACHING/PRESENT/DEPARTING (we've seen
      * it recently), this is a no-op (transition_phone checks for same-state).
      *
-     * L4 will add:
-     *   - if state == APPROACHING and kalman_x > UNLOCK_RSSI and dwell >= 3s:
-     *       transition to PRESENT, fire unlock
-     *   - if state == PRESENT and kalman_x < RELOCK_RSSI and dwell >= 5s:
-     *       transition to DEPARTING, fire relock
-     *   - if state == DEPARTING and no MATCH for >DEPARTING_TIMEOUT:
-     *       transition to ABSENT
-     *
-     * Note: the -90 dBm floor for ABSENT->APPROACHING (from handoff section 7.1)
-     * is deferred to L4. In L1, any MATCH transitions to APPROACHING. The
-     * scan.c filter (CID + version) is enough filtering for L1. L4 adds the
-     * RSSI floor as part of the threshold logic.
+     * Phase 3 L4 delivered: the -90 dBm first-sight floor lives HERE
+     * (the far-phone check above); the threshold/dwell/trend
+     * transitions live in the TICK's evaluate_phone, not here -- rule
+     * R5 (worklog 3-L3-A): level and trend are consumed in the same
+     * tick that computed them, one consistent snapshot.
      */
     if (phones[slot].state == PHONE_STATE_ABSENT) {
         char uuid_str[MSD_LEN_UUID * 2U + 1U];
@@ -886,4 +1141,17 @@ uint8_t proximity_get_count(void)
         }
     }
     return count;
+}
+
+int proximity_register_event_cb(proximity_event_cb_t cb)
+{
+    /*
+     * Phase 3 L4. Plain pointer store -- safe by the ordering contract
+     * documented in proximity.h: register from main() BEFORE
+     * bt_enable(); the evaluator that fires events only ever runs on
+     * the system workqueue, which is only fed after BLE comes up.
+     * No locking needed, cannot fail.
+     */
+    event_cb = cb;
+    return 0;
 }

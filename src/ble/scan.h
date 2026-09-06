@@ -17,6 +17,10 @@
  * Ch2 scope: logged every received adv (addr, RSSI, type). No parsing yet.
  * Ch3 scope: added bt_data_parse + MSD extraction + version for matched advs
  * Ch4 scope: formalized the threading model and add a dedicated workqueue.
+ *
+ * Phase 3 ch1 note: this file is UNCHANGED from L4. The proximity module
+ * (proximity.h / proximity.c) is a new, separate module. scan.h only needs
+ * to provide MSD_LEN_UUID to proximity.h, which it already does.
  */
 
 #include <zephyr/kernel.h>

@@ -4,6 +4,24 @@
 //   bt_enable() with async callback pattern 
 //   bt_ready_cb() that logs BLE readiness
 //
+// Phase 3 ch1 changes (search for "Phase 3 ch1" to find them):
+//   1. Added #include "ble/proximity.h"
+//   2. Added proximity_init() call in bt_ready_cb, right after scan_start()
+//      This initializes the phone-tracking registry + schedules the 1s tick.
+//
+// Phase 3 ch4 changes (search for "Phase 3 ch4" to find them):
+//   1. pulse_relay() -> pulse_relay_async(): the 500 ms OFF-step is now a
+//      k_work_delayable. The old k_sleep(500) was fine from main-thread
+//      context (the 'u' command) but is a BUG from the proximity callback,
+//      which runs on the SYSTEM WORKQUEUE -- a sleeping handler there
+//      stalls scan_work, proximity_tick and every other sysworkq user.
+//   2. proximity_event_handler: UNLOCK -> relay pulse; RELOCK -> logged
+//      hook point for the Phase 5 gate state machine.
+//   3. proximity_register_event_cb() called before bt_enable() (ordering
+//      IS the thread-safety story; see proximity.h).
+//   4. 'u' command uses the async pulse too (same code path as the real
+//      unlock -- one pulse implementation, not two).
+//
 // LED mappings:
 //   LED 1 ON  = app started
 //   LED 2 ON  = survived SYS_INIT (I am currently using this pin for relay triggering)
@@ -56,14 +74,87 @@ static int config_led(const struct gpio_dt_spec *led)
     return gpio_pin_configure_dt(led, GPIO_OUTPUT_INACTIVE);
 }
 
-/* Pulse the relay for 500ms to unlock the gate */
-static void pulse_relay(void)
+/* ============================================================
+ * Phase 3 ch4: non-blocking relay pulse
+ * ============================================================ */
+
+/*
+ * Why the old pulse_relay() had to die: it called k_sleep(500) between
+ * ON and OFF. From main-thread context (the 'u' command) that was
+ * merely ugly. From the proximity callback it would be a BUG: the
+ * callback runs on the system workqueue, and a sleeping handler there
+ * stalls EVERYTHING that shares the queue -- scan_work_handler stops
+ * draining (the 32-deep msgq backs up and starts dropping advs within
+ * ~1-2 s at ambient traffic), proximity_tick is delayed (dwell credits
+ * inflate by the stall), the stats dump slips. Zephyr rule: system
+ * workqueue handlers must not block.
+ *
+ * Fix: split the pulse. ON is a direct GPIO write; the OFF 500 ms later
+ * is a k_work_delayable scheduled onto the same (system) workqueue.
+ * Re-pulse while active just reschedules the OFF work -- worst case the
+ * relay stays ON slightly longer (two residents unlocking at once);
+ * harmless for a strike pulse. (One residual, documented: the manual
+ * 'u' command runs in MAIN-thread context and can race the OFF work --
+ * worst case a manual pulse gets cut short. Dev-only command, ignored.)
+ *
+ * k_work_delayable vs k_timer: the OFF step toggles a GPIO, legal from
+ * a timer callback (ISR) too, but a work item keeps the actuation in
+ * THREAD context -- consistent with everything else this project does
+ * from workqueues, and the exact pattern already used by
+ * proximity_tick and the scan stats dump. No new API to learn.
+ */
+static void relay_off_handler(struct k_work *work);
+
+K_WORK_DELAYABLE_DEFINE(relay_off_work, relay_off_handler);
+
+static void relay_off_handler(struct k_work *work)
 {
-    printk(">>> UNLOCK: relay is ON for 500ms ..\r\n");
-    gpio_pin_set_dt(&relay, 1);
-    k_sleep(K_MSEC(500));
+    ARG_UNUSED(work);
     gpio_pin_set_dt(&relay, 0);
-    printk(">>> RELOCK: relay is OFF ... \r\n");
+    /* LOG_INF, not printk: printk is SYNCHRONOUS (it writes through the
+     * console driver directly -- can block if the USB host stalls);
+     * LOG is deferred to the log thread. From workqueue context only
+     * the deferred form is safe. (The GATE / status printks below stay
+     * printk: they run in main-thread context.)
+     */
+    LOG_INF("relay pulse complete (OFF)");
+}
+
+static void pulse_relay_async(void)
+{
+    gpio_pin_set_dt(&relay, 1);
+    LOG_INF("UNLOCK: relay ON, off in 500ms");
+    (void)k_work_reschedule(&relay_off_work, K_MSEC(500));
+}
+
+/*
+ * Phase 3 L4: proximity events -> hardware.
+ *
+ * Runs in SYSTEM WORKQUEUE context (the proximity tick): no blocking,
+ * no printk. The audit lines (uuid, x, slope, dwell) are already logged
+ * by proximity.c -- this handler is pure actuation.
+ *
+ * Phase 4: the authentication gate goes here (unlock events from
+ * unauthenticated phones must not reach the relay). Phase 5: the gate
+ * state machine consumes RELOCK.
+ */
+static void proximity_event_handler(enum proximity_event evt, uint8_t slot,
+                                    const uint8_t *uuid)
+{
+    ARG_UNUSED(slot);
+    ARG_UNUSED(uuid);
+
+    switch (evt) {
+    case PROX_EVENT_UNLOCK:
+        pulse_relay_async();
+        break;
+    case PROX_EVENT_RELOCK:
+        /* Informational today: the strike is spring-return, there is
+         * nothing to actuate. Phase 5 hooks the gate state machine
+         * here (relock + reed = gate secured).
+         */
+        break;
+    }
 }
 
 /* ============================================================
@@ -181,6 +272,13 @@ int main(void)
 
     gpio_pin_set_dt(&led4, 1);
 
+    /* Phase 3 ch4: register the actuation callback BEFORE BLE starts
+     * (bt_enable -> bt_ready_cb -> scan + proximity). Ordering IS the
+     * thread-safety story: the evaluator that fires events only runs
+     * on the system workqueue, which is only fed after this point.
+     */
+    proximity_register_event_cb(proximity_event_handler);
+
     /* === Start BLE init (async; returns immediately) === */
     int err = bt_enable(bt_ready_cb);
     if (err) {
@@ -231,8 +329,9 @@ int main(void)
                     {
                         rx_buf[rx_idx] = 0;
                         if (rx_buf[0] == 'u' || rx_buf[0] == 'U') {
-                            // unlock the gate
-                            pulse_relay();
+                            // unlock the gate (Phase 3 ch4: async pulse,
+                            // same code path as the proximity unlock)
+                            pulse_relay_async();
                         } else if (rx_buf[0] == 's' || rx_buf[0] == 'S') {
                             printk("Status: gate=%s relay=%d\r\n",
                                    reed_closed ? "CLOSED" : "OPEN",

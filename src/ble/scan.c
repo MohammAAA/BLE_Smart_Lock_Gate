@@ -1,7 +1,21 @@
 /*
  * BLE Smart Lock - Gate Scanner
- * Phase 3 ch1: feed MATCH into proximity tracking module.
+ * Phase 2 Ch4: threading model + stats + drop counters + stack monitor
+ * Phase 3 Ch1 addition: feed MATCH into proximity tracking module.
  *
+ * Ch4 scope:
+ *   - stats counters (struct scan_stats)
+ *   - drop counter in scan_cb (queue_drops)
+ *   - guard counters in scan_cb (addr/rssi/buf NULL)
+ *   - matched/non_matched/trunc/ver_mismatch counters in workqueue
+ *   - periodic stats dump via k_work_delayable
+ *   - stack high-water mark via k_thread_stack_space_get
+ *
+ * Phase 3 ch1 changes (search for "Phase 3 ch1" to find them):
+ *   1. Added #include "proximity.h" near the other includes
+ *   2. Added proximity_on_match() call in scan_work_handler, right after
+ *      the MATCH log line. This feeds each matched adv into the proximity
+ *      tracking module (phone registry + state machine).
  *
  * Threading model:
  *
@@ -253,7 +267,8 @@ static void scan_work_handler(struct k_work *work)
                  *   - Lookup-or-alloc a phone_track slot by UUID
                  *   - Update last_rssi, last_match_time, match_count
                  *   - State machine: ABSENT -> APPROACHING (on first MATCH)
-                 *   - (L4 will add: APPROACHING -> PRESENT on RSSI + dwell)
+                 *   - (ch4 delivered: the threshold/dwell transitions live
+                 *     in the proximity tick's evaluate_phone, not here)
                  *
                  * We pass a pointer to the UUID bytes within the MSD payload
                  * (ctx.msd_data + MSD_OFFSET_UUID). The proximity module
