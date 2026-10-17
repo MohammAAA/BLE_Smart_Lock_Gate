@@ -3,3 +3,6 @@ build/
 Hardware/
 LearningMaterial/
 logs/
+docs/figures
+scripts/build_spec_html.py
+scripts/create_spec_rev4.py
